@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/artifacts/
+data/smartgpms.sqlite3
+data/smartgpms.sqlite3-shm
+data/smartgpms.sqlite3-wal
+data/cache/
+data/evidence/
+data/credentials.json
+data/browser-profile/
+data/ui-smoke.png
+data/ui-results-smoke.png
+data/captured_*_dom.html

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>smartGPMS 门证核验</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><span class="brand-mark">GP</span><strong>smartGPMS</strong><small>门证照片智能核验</small></div>
+    <div class="session-line"><i id="session-dot"></i><span id="session-text">正在读取状态</span><button id="check-session" class="text-button">检查会话</button></div>
+  </header>
+  <main class="workspace">
+    <aside class="input-panel">
+      <div class="eyebrow">待处理队列</div>
+      <h1>输入集装箱号</h1>
+      <p>每行一个箱号，也可用空格、逗号分隔。按 Ctrl + Enter 开始核验。</p>
+      <textarea id="containers" spellcheck="false" placeholder="例如：&#10;MSCU1234566&#10;TGHU7654321"></textarea>
+      <div class="input-meta"><span id="input-count">0 个箱号</span><button id="clear-input" class="text-button">清空</button></div>
+      <button id="verify" class="primary">识别并核验</button>
+      <button id="sync" class="secondary">立即同步 CPM 数据</button>
+      <div class="local-note"><strong>本机处理</strong><span>RapidOCR + ONNX CPU，不需要 P3 镜像</span></div>
+    </aside>
+
+    <section class="result-panel">
+      <section id="login-card" class="login-card hidden">
+        <div class="login-logo">LG <span>Enterprise Portal</span></div>
+        <h2>SSO 登录</h2>
+        <p>凭据由 smartGPMS 使用 Windows DPAPI 加密保存；OTP 不保存。</p>
+        <label>USER ID<input id="username" autocomplete="username"></label>
+        <label>PASSWORD<input id="password" type="password" autocomplete="current-password" placeholder="已保存时可留空"></label>
+        <label>OTP PASSWORD<input id="otp" inputmode="numeric" autocomplete="one-time-code"></label>
+        <label class="remember"><input id="remember" type="checkbox" checked> 在本机加密保存用户名和密码</label>
+        <button id="login" class="login-button">Login</button>
+        <div id="login-message" class="form-message"></div>
+      </section>
+
+      <section id="results">
+        <div class="result-heading">
+          <div><div class="eyebrow">核验结果</div><h2>门证与四阶段照片</h2></div>
+          <div class="legend"><span class="green">一致</span><span class="red">不一致</span><span class="orange">待确认</span></div>
+        </div>
+        <div class="table-shell">
+          <table>
+            <thead><tr><th>打印</th><th>状态</th><th>门证箱号</th><th>门证铅封号</th><th>照片箱号区域 / OCR</th><th>照片铅封区域 / OCR</th><th>最后打印时间</th></tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+          <div id="empty" class="empty"><div class="empty-icon">▦</div><strong>等待核验</strong><span>输入箱号后，系统会从 DAS 获取门证字段和四阶段照片。</span></div>
+        </div>
+      </section>
+    </section>
+  </main>
+  <div id="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
