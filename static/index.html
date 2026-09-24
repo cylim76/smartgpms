@@ -4,54 +4,82 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>smartGPMS 门证核验</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/styles.css?v=0.10.3">
 </head>
 <body>
   <header class="topbar">
-    <div><span class="brand-mark">GP</span><strong>smartGPMS</strong><small>门证照片智能核验</small></div>
-    <div class="session-line"><i id="session-dot"></i><span id="session-text">正在读取状态</span><button id="check-session" class="text-button">检查会话</button></div>
+    <div class="brand-title"><span class="brand-mark">GP</span><span class="brand-copy"><strong class="app-title">Smart GPMS</strong><small>集装箱智能通门</small></span></div>
+    <div class="session-line"><i id="session-dot"></i><span id="session-text">未登录</span><button id="check-session" class="refresh-button" title="刷新" aria-label="刷新会话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></svg></button></div>
   </header>
-  <main class="workspace">
-    <aside class="input-panel">
-      <div class="eyebrow">待处理队列</div>
+  <main id="workspace" class="workspace login-mode">
+    <aside id="input-panel" class="input-panel hidden">
       <h1>输入集装箱号</h1>
       <p>每行一个箱号，也可用空格、逗号分隔。按 Ctrl + Enter 开始核验。</p>
       <textarea id="containers" spellcheck="false" placeholder="例如：&#10;MSCU1234566&#10;TGHU7654321"></textarea>
       <div class="input-meta"><span id="input-count">0 个箱号</span><button id="clear-input" class="text-button">清空</button></div>
       <button id="verify" class="primary">识别并核验</button>
-      <button id="sync" class="secondary">立即同步 CPM 数据</button>
-      <div class="local-note"><strong>本机处理</strong><span>RapidOCR + ONNX CPU，不需要 P3 镜像</span></div>
+      <div class="local-note"><span>RapidOCR + ONNX CPU</span></div>
     </aside>
 
     <section class="result-panel">
-      <section id="login-card" class="login-card hidden">
-        <div class="login-logo">LG <span>Enterprise Portal</span></div>
-        <h2>SSO 登录</h2>
-        <p>凭据由 smartGPMS 使用 Windows DPAPI 加密保存；OTP 不保存。</p>
-        <label>USER ID<input id="username" autocomplete="username"></label>
+      <section id="login-card" class="login-card">
+        <div class="login-brand-row">
+          <img class="login-lg-logo" src="/static/assets/lg-logo.jpg" alt="LG Life's Good">
+          <span class="login-reinvent-clip">
+            <img class="login-reinvent-logo" src="/static/assets/newlogo-login-cropped.png" alt="REINVENT 2.0">
+          </span>
+        </div>
+        <label>USER ID<input id="username" autocomplete="username" autofocus></label>
         <label>PASSWORD<input id="password" type="password" autocomplete="current-password" placeholder="已保存时可留空"></label>
-        <label>OTP PASSWORD<input id="otp" inputmode="numeric" autocomplete="one-time-code"></label>
-        <label class="remember"><input id="remember" type="checkbox" checked> 在本机加密保存用户名和密码</label>
+        <label>OTP<input id="otp" inputmode="numeric" autocomplete="one-time-code"></label>
+        <label class="remember"><input id="remember" type="checkbox" checked> 保存用户名密码(使用 Windows DPAPI 加密)</label>
         <button id="login" class="login-button">Login</button>
         <div id="login-message" class="form-message"></div>
       </section>
 
-      <section id="results">
+      <section id="results" class="hidden">
         <div class="result-heading">
-          <div><div class="eyebrow">核验结果</div><h2>门证与四阶段照片</h2></div>
+          <div><div class="eyebrow">核验结果</div><h2>门证/监装照片核对</h2></div>
           <div class="legend"><span class="green">一致</span><span class="red">不一致</span><span class="orange">待确认</span></div>
         </div>
         <div class="table-shell">
           <table>
-            <thead><tr><th>打印</th><th>状态</th><th>门证箱号</th><th>门证铅封号</th><th>照片箱号区域 / OCR</th><th>照片铅封区域 / OCR</th><th>最后打印时间</th></tr></thead>
+            <thead><tr><th>打印</th><th>状态</th><th>门证箱号</th><th>门证铅封号</th><th>照片箱号区域 / OCR</th><th>照片铅封区域 / OCR</th><th>其他四阶段照片</th><th>最后打印时间</th></tr></thead>
             <tbody id="rows"></tbody>
           </table>
           <div id="empty" class="empty"><div class="empty-icon">▦</div><strong>等待核验</strong><span>输入箱号后，系统会从 DAS 获取门证字段和四阶段照片。</span></div>
         </div>
+        <section class="activity-panel">
+          <div class="activity-title"><strong>运行日志</strong><span id="activity-state">等待任务</span></div>
+          <div id="activity-log" class="activity-log"><div class="activity-empty">系统的登录、同步、下载和识别进度会显示在这里。</div></div>
+        </section>
       </section>
     </section>
   </main>
+  <div id="image-viewer" class="image-viewer hidden" role="dialog" aria-modal="true" aria-label="原图预览">
+    <div class="image-viewer-hint">滚轮缩放 · 按住图片拖动 · 点击空白处关闭</div>
+    <img id="image-viewer-photo" class="image-viewer-photo" alt="第四阶段原图" draggable="false">
+  </div>
+  <div id="print-dialog" class="print-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="print-dialog-title">
+    <section class="print-dialog-card">
+      <div class="eyebrow">SMART GPMS</div>
+      <h3 id="print-dialog-title">打印确认</h3>
+      <p id="print-dialog-message"></p>
+      <fieldset id="print-reason-wrap" class="print-reason-wrap">
+        <legend>确认原因</legend>
+        <label class="reason-option"><input type="checkbox" name="print-reason" value="识别错误，人工核对完毕"> <span>识别错误，人工核对完毕</span></label>
+        <label class="reason-option"><input type="checkbox" name="print-reason" value="照片缺失，实物已确认"> <span>照片缺失，实物已确认</span></label>
+        <label class="reason-option"><input id="print-reason-other-toggle" type="checkbox" name="print-reason" value="其他"> <span>其他</span></label>
+        <textarea id="print-dialog-reason" class="hidden" rows="3" placeholder="请填写其他确认原因"></textarea>
+      </fieldset>
+      <div class="print-dialog-actions">
+        <button id="print-dialog-cancel" class="dialog-cancel" type="button">取消</button>
+        <button id="print-dialog-confirm" class="dialog-confirm" type="button">确认打印</button>
+      </div>
+    </section>
+  </div>
   <div id="toast" role="status"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=0.10.3"></script>
+  <script src="/static/local-first.js?v=0.10.3"></script>
 </body>
 </html>

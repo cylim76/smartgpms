@@ -1,7 +1,10 @@
+from PIL import Image
+
 from smartgpms.recognition import (
     OCRItem,
     extract_container_candidates,
     find_seal_candidate,
+    save_crop,
 )
 
 
@@ -27,3 +30,34 @@ def test_container_crop_excludes_text_after_number():
     ]
     best = extract_container_candidates(items, "CMAU4338290")[0]
     assert best["source_indices"] == [0, 1]
+
+
+def test_complete_vertical_container_crop_is_tight_and_saved_horizontally(tmp_path):
+    image = Image.new("RGB", (1280, 720), "white")
+    items = [
+        OCRItem(
+            text="754634 9",
+            score=0.97,
+            box=[[443, 42], [491, 43], [487, 186], [440, 185]],
+        ),
+        OCRItem(
+            text="FCIU",
+            score=0.98,
+            box=[[440, 203], [481, 203], [481, 273], [440, 273]],
+        ),
+    ]
+    target = tmp_path / "crop.jpg"
+
+    save_crop(
+        image,
+        items,
+        [1, 0],
+        target,
+        target_type="container",
+        complete=True,
+        source_rotation=90,
+    )
+
+    with Image.open(target) as crop:
+        assert crop.width > crop.height
+        assert crop.width < image.width / 2

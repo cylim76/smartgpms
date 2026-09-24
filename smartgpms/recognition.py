@@ -251,10 +251,53 @@ def _bounds(
 
 
 def save_crop(
-    image: Image.Image, items: list[OCRItem], indices: list[int], target: Path
+    image: Image.Image,
+    items: list[OCRItem],
+    indices: list[int],
+    target: Path,
+    target_type: str = "",
+    complete: bool = False,
+    source_rotation: int = 0,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
-    crop = image.crop(_bounds(items, indices, image.size))
+    if target_type == "container" and not complete:
+        points = [point for index in indices for point in items[index].box]
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+        left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
+        item_sizes = []
+        for index in indices:
+            item_xs = [float(point[0]) for point in items[index].box]
+            item_ys = [float(point[1]) for point in items[index].box]
+            item_sizes.append(
+                min(max(item_xs) - min(item_xs), max(item_ys) - min(item_ys))
+            )
+        text_height = max(1.0, sum(item_sizes) / len(item_sizes))
+        width, height = image.size
+        bounds = (
+            max(0, int(left - text_height * 0.8)),
+            max(0, int(top - text_height * 1.0)),
+            min(width, int(right + text_height * 3.0)),
+            min(height, int(bottom + text_height * 1.0)),
+        )
+    else:
+        bounds = _bounds(items, indices, image.size)
+    crop = image.crop(bounds)
+    vertical_boxes = horizontal_boxes = 0
+    for index in indices:
+        xs = [float(point[0]) for point in items[index].box]
+        ys = [float(point[1]) for point in items[index].box]
+        if max(ys) - min(ys) > max(xs) - min(xs):
+            vertical_boxes += 1
+        else:
+            horizontal_boxes += 1
+    if vertical_boxes > horizontal_boxes:
+        transpose = (
+            Image.Transpose.ROTATE_270
+            if source_rotation == 90
+            else Image.Transpose.ROTATE_90
+        )
+        crop = crop.transpose(transpose)
     crop.save(target, format="JPEG", quality=94)
 
 
