@@ -23,6 +23,8 @@ from .time_utils import business_now
 
 LOGGER = logging.getLogger(__name__)
 ACTIVITY_RETENTION_SECONDS = 2 * 60 * 60
+INITIAL_IMPORT_MIN = 500
+INITIAL_IMPORT_MAX = 1000
 
 
 class ServiceStopping(RuntimeError):
@@ -228,18 +230,60 @@ class SmartGPMSService:
             else:
                 self.credentials.clear()
             self.database.update_session("logged_in", username, "会话有效")
-            self._startup_sync_pending = True
+            initial_import = self.initial_import_state()
+            self._startup_sync_pending = not bool(initial_import["required"])
             self._background_resume_at = time.monotonic() + 15
-            if self.database.get_setting("cpm_initialized") == "1":
+            if initial_import["required"]:
+                message = "登录成功；请确认首次导入数量"
+            elif self.database.get_setting("cpm_initialized") == "1":
                 message = "登录成功；后台巡检将在 07:00–23:59 自动运行"
             else:
-                message = "登录成功；将在作业时段初始化最新 500 条监装记录"
+                message = (
+                    "登录成功；将在作业时段初始化最新 "
+                    f"{initial_import['target']} 条监装记录"
+                )
             self.log_activity(message, source="login")
-            return result
+            return {**result, "initial_import": initial_import}
         except Exception as exc:
             self.database.update_session("logged_out", username, str(exc))
             self.log_activity(f"登录失败：{exc}", "error", "login")
             raise
+
+    def initial_import_state(self) -> dict[str, int | bool]:
+        """Describe whether an empty installation still needs user confirmation."""
+        saved = self.database.get_setting("initial_import_target").strip()
+        try:
+            target = int(saved) if saved else self.config.startup_snapshot_size
+        except ValueError:
+            target = self.config.startup_snapshot_size
+        required = self.database.cpm_record_count() == 0 and not saved
+        return {
+            "required": required,
+            "configured": bool(saved),
+            "target": target,
+            "default": self.config.startup_snapshot_size,
+            "minimum": INITIAL_IMPORT_MIN,
+            "maximum": INITIAL_IMPORT_MAX,
+        }
+
+    def configure_initial_import(self, target: int) -> dict[str, int | bool]:
+        """Persist the one-time import target and release background initialization."""
+        if not INITIAL_IMPORT_MIN <= target <= INITIAL_IMPORT_MAX:
+            raise ValueError(
+                f"初次导入数量必须在 {INITIAL_IMPORT_MIN}–{INITIAL_IMPORT_MAX} 之间"
+            )
+        state = self.initial_import_state()
+        if not state["required"]:
+            return state
+        self.database.set_setting("initial_import_target", str(target))
+        self.database.set_setting("cpm_initialized", "0")
+        self._startup_sync_pending = True
+        self._background_resume_at = time.monotonic()
+        self.log_activity(
+            f"首次导入数量已设置为 {target} 箱，后台初始化即将开始",
+            source="sync",
+        )
+        return self.initial_import_state()
 
     def sync_latest_window(
         self,
@@ -247,7 +291,8 @@ class SmartGPMSService:
         gate_checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
         """Discover new CPMIDs downward, then maintain only incomplete 30-day rows."""
-        limit = limit or self.config.startup_snapshot_size
+        if limit is None:
+            limit = int(self.initial_import_state()["target"])
         if not self._task_lock.acquire(blocking=False):
             self.log_activity("监装数据同步已在运行，本次请求未重复启动", "warning", "sync")
             return self._sync_result(busy=True)
@@ -283,8 +328,6 @@ class SmartGPMSService:
                 limit * 3 if initializing else self.config.daily_scan_safety_limit
             )
             checked_ids = 0
-            reached_date_boundary = False
-
             while checked_ids < max_checks:
                 if self._drain_requested.is_set():
                     break
@@ -299,8 +342,7 @@ class SmartGPMSService:
                 current = self.database.cpm_by_id(cpm_id)
                 metadata = current or listed.get(cpm_id) or {}
                 known_date = self._business_date(str(metadata.get("begin_date", "")))
-                if known_date and known_date < cutoff:
-                    reached_date_boundary = True
+                if not initializing and known_date and known_date < cutoff:
                     break
                 if initializing and current:
                     continue
@@ -320,8 +362,7 @@ class SmartGPMSService:
                     continue
                 detail = self._merge_listing_metadata(detail, listed.get(cpm_id) or {})
                 detail_date = self._business_date(str(detail.get("begin_date", "")))
-                if detail_date and detail_date < cutoff:
-                    reached_date_boundary = True
+                if not initializing and detail_date and detail_date < cutoff:
                     break
                 counters["scanned"] += 1
                 previous, saved = self.database.upsert_cpm(
@@ -395,9 +436,7 @@ class SmartGPMSService:
                 self._log_sync_progress(mode, counters)
                 self._photo_scan_checkpoint(counters, gate_checkpoint)
 
-            if initializing and (
-                self.database.cpm_record_count() >= limit or reached_date_boundary
-            ):
+            if initializing and self.database.cpm_record_count() >= limit:
                 self.database.set_setting("cpm_initialized", "1")
             self.database.set_setting("latest_cpm_id", str(latest))
             self.database.set_setting("snapshot_oldest_cpm_id", oldest)
@@ -1582,6 +1621,8 @@ class SmartGPMSService:
                         )
                     if self._drain_requested.is_set():
                         break
+                if self.initial_import_state()["required"]:
+                    continue
                 if startup_sync or now >= next_photo_sync:
                     try:
                         self.sync_latest_window(

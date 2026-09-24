@@ -350,6 +350,78 @@ def test_new_install_initializes_current_valid_window(tmp_path):
         service.stop()
 
 
+def test_empty_install_waits_for_and_persists_initial_import_target(tmp_path):
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    try:
+        assert service.initial_import_state() == {
+            "required": True,
+            "configured": False,
+            "target": 500,
+            "default": 500,
+            "minimum": 500,
+            "maximum": 1000,
+        }
+
+        configured = service.configure_initial_import(750)
+
+        assert configured["required"] is False
+        assert configured["configured"] is True
+        assert configured["target"] == 750
+        assert database.get_setting("initial_import_target") == "750"
+        assert service.configure_initial_import(900)["target"] == 750
+    finally:
+        service.stop()
+
+
+def test_first_import_count_is_not_cut_short_by_thirty_day_boundary(tmp_path):
+    class HistoricalSnapshotBrowser:
+        @staticmethod
+        def cpm_snapshot(_limit):
+            return [
+                {
+                    "cpm_id": "100",
+                    "container_no": "TEST0000100",
+                    "begin_date": "2020-01-01 00:00:00",
+                }
+            ]
+
+        @staticmethod
+        def fetch_cpm_detail(cpm_id, _refresh):
+            return {
+                "cpm_id": cpm_id,
+                "container_no": f"TEST{int(cpm_id):07d}",
+                "begin_date": "2020-01-01 00:00:00",
+                "business_stage": 1,
+                "das_process_status": 1,
+                "photos": [],
+            }
+
+        @staticmethod
+        def close():
+            return None
+
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    service.browser = HistoricalSnapshotBrowser()
+    try:
+        result = service.sync_latest_window(limit=2)
+
+        assert result["scanned"] == 2
+        assert database.cpm_record_count() == 2
+        assert database.get_setting("cpm_initialized") == "1"
+    finally:
+        service.stop()
+
+
 def test_snapshot_backfills_ids_missing_from_first_result_page(tmp_path):
     config = AppConfig(tmp_path, startup_snapshot_size=4)
     database = Database(tmp_path / "data" / "test.sqlite3")

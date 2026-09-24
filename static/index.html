@@ -7,7 +7,7 @@
   <link rel="icon" href="/static/assets/smartgpms-app.ico?v=1" sizes="any">
   <link rel="icon" type="image/png" href="/static/assets/smartgpms-app.png?v=1">
   <link rel="apple-touch-icon" href="/static/assets/smartgpms-app.png?v=1">
-  <link rel="stylesheet" href="/static/styles.css?v=0.14.0">
+  <link rel="stylesheet" href="/static/styles.css?v=0.14.1">
 </head>
 <body>
   <header class="topbar">
@@ -68,6 +68,18 @@
     <div class="image-viewer-hint">滚轮缩放 · 按住图片拖动 · 点击空白处关闭</div>
     <img id="image-viewer-photo" class="image-viewer-photo" alt="第四阶段原图" draggable="false">
   </div>
+  <div id="initial-import-dialog" class="initial-import-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="initial-import-title">
+    <section class="initial-import-card">
+      <div class="eyebrow">SMART GPMS</div>
+      <h3 id="initial-import-title">初始化监装数据</h3>
+      <p>本机尚无监装记录，请设置首次导入数量。首次导入将在后台从最新记录开始向前同步，同时下载符合条件的封箱照片。</p>
+      <label for="initial-import-count">初次导入数量</label>
+      <div class="initial-import-input"><input id="initial-import-count" type="number" min="500" max="1000" step="100" value="500" inputmode="numeric"><span>箱</span></div>
+      <small>建议 500–1000 箱；默认 500 箱。</small>
+      <div id="initial-import-message" class="form-message"></div>
+      <div class="initial-import-actions"><button id="initial-import-confirm" type="button">开始初始化</button></div>
+    </section>
+  </div>
   <div id="print-dialog" class="print-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="print-dialog-title">
     <section class="print-dialog-card">
       <div class="eyebrow">SMART GPMS</div>
@@ -87,7 +99,7 @@
     </section>
   </div>
   <div id="toast" role="status"></div>
-  <script src="/static/app.js?v=0.14.0"></script>
+  <script src="/static/app.js?v=0.14.1"></script>
   <script src="/static/local-first.js?v=0.12.2"></script>
 </body>
 </html>

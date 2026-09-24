@@ -108,10 +108,50 @@ def test_left_panel_allocates_remaining_height_to_departure_list():
     markup = (root / "static" / "index.html").read_text(encoding="utf-8")
     styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'styles.css?v=0.14.0' in markup
+    assert 'styles.css?v=0.14.1' in markup
     assert ".input-panel>textarea{height:200px" in styles
     assert ".departure-panel{display:flex;min-height:150px;flex:1 1 auto" in styles
     assert ".departure-list{min-height:70px;max-height:none;flex:1 1 auto" in styles
+
+
+def test_empty_install_has_blocking_initial_import_dialog_contract():
+    root = app_module.BASE_DIR
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    script = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="initial-import-dialog"' in markup
+    assert 'id="initial-import-count"' in markup
+    assert 'min="500" max="1000"' in markup
+    assert 'value="500"' in markup
+    assert 'id="initial-import-confirm"' in markup
+    assert 'api("/api/initial-import"' in script
+    assert 'app.js?v=0.14.1' in markup
+
+
+def test_initial_import_endpoint_requires_login_and_validates_range(
+    tmp_path, monkeypatch
+):
+    database = Database(tmp_path / "smartgpms.sqlite3")
+    monkeypatch.setattr(app_module, "database", database)
+    monkeypatch.setattr(app_module.service, "database", database)
+    monkeypatch.setattr(app_module.service, "_startup_sync_pending", False)
+    monkeypatch.setattr(app_module.service, "_background_resume_at", 0.0)
+
+    with pytest.raises(HTTPException) as logged_out:
+        app_module.configure_initial_import(app_module.InitialImportPayload(count=500))
+    assert logged_out.value.status_code == 401
+
+    database.update_session("logged_in", "operator", "会话有效")
+    with pytest.raises(HTTPException) as invalid:
+        app_module.configure_initial_import(app_module.InitialImportPayload(count=499))
+    assert invalid.value.status_code == 400
+
+    result = app_module.configure_initial_import(
+        app_module.InitialImportPayload(count=800)
+    )
+    assert result["ok"] is True
+    assert result["target"] == 800
+    assert result["required"] is False
 
 
 def test_print_spool_copy_does_not_inherit_expired_cache_timestamp(tmp_path):

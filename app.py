@@ -64,7 +64,7 @@ async def lifespan(_: FastAPI):
     service.stop()
 
 
-app = FastAPI(title="smartGPMS", version="0.14.0", lifespan=lifespan)
+app = FastAPI(title="smartGPMS", version="0.14.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -86,6 +86,10 @@ class GateVerifyPayload(BaseModel):
 class GateNoticeAckPayload(BaseModel):
     gate_key: str
     planned_departure_at: str
+
+
+class InitialImportPayload(BaseModel):
+    count: int = 500
 
 
 class PrintPayload(BaseModel):
@@ -309,6 +313,7 @@ def bootstrap():
         "photo_sync_interval_seconds": config.photo_sync_interval_seconds,
         "ocr_engine": "RapidOCR / ONNX Runtime CPU",
         "database": database.stats(),
+        "initial_import": service.initial_import_state(),
     }
 
 
@@ -342,7 +347,20 @@ def check_session():
 @app.get("/api/session/status")
 def session_status():
     """Return the last background-verified state without opening DAS."""
-    return database.session()
+    return {
+        **database.session(),
+        "initial_import": service.initial_import_state(),
+    }
+
+
+@app.post("/api/initial-import")
+def configure_initial_import(payload: InitialImportPayload):
+    _logged_in_username()
+    try:
+        state = service.configure_initial_import(payload.count)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **state}
 
 
 @app.post("/api/sync")
