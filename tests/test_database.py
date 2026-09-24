@@ -77,6 +77,39 @@ def test_new_ocr_pipeline_invalidates_derived_results_only_once(tmp_path):
     assert database.cpm_by_id("88")["ocr_status"] == "ready"
 
 
+def test_check_digit_pipeline_invalidates_only_ten_character_container_ocr(tmp_path):
+    database = Database(tmp_path / "test.sqlite3")
+    for cpm_id, observed in (("88", "TXGU607166"), ("89", "CAJU6050344")):
+        database.upsert_cpm(
+            {"cpm_id": cpm_id, "container_no": "TXGU6071669", "business_stage": 4}
+        )
+        photo = database.save_photo(
+            cpm_id,
+            {
+                "step_code": "S1",
+                "step_no": 4,
+                "source_url": f"http://das/{cpm_id}.jpg",
+                "cache_status": "ready",
+            },
+        )
+        database.save_ocr(
+            cpm_id,
+            int(photo["id"]),
+            "container",
+            {"observed": observed, "source_hash": cpm_id},
+        )
+        database.update_ocr_status(cpm_id, "ready")
+
+    assert (
+        database.activate_ocr_pipeline(
+            "check-digit-v4", incomplete_container_only=True
+        )
+        == 1
+    )
+    assert database.cpm_by_id("88")["ocr_status"] == "pending"
+    assert database.cpm_by_id("89")["ocr_status"] == "ready"
+
+
 def test_archive_status_five_survives_metadata_refresh(tmp_path):
     database = Database(tmp_path / "test.sqlite3")
     record = {"cpm_id": "99", "container_no": "MSCU6639870", "business_stage": 4}
@@ -175,6 +208,59 @@ def test_gate_pass_prefers_latest_planned_departure_and_tracks_pdf(tmp_path):
         }
     )
     assert database.gate_pass_by_key(selected["gate_key"])["pdf_status"] == "stale"
+
+
+def test_pending_gate_departures_excludes_departed_and_tracks_ack_by_user(tmp_path):
+    database = Database(tmp_path / "test.sqlite3")
+    database.upsert_cpm(
+        {
+            "cpm_id": "100",
+            "container_no": "CAJU6050344",
+            "product_type": "空调",
+            "business_stage": 4,
+            "photo_count": 3,
+        }
+    )
+    base = {
+        "application_date": "2026-09-24",
+        "seal_no": "SEAL1",
+        "source_fingerprint": "v1",
+    }
+    for sequence, container, planned, actual in (
+        ("1", "MSCU6639870", "2026-09-24 09:30:00", ""),
+        ("2", "CAJU6050344", "2026/09/24 09:45:00", "-"),
+        ("3", "TCNU5891927", "2026-09-24 09:50:00", "2026-09-24 09:55:00"),
+        ("4", "TLLU7886068", "2026-09-23 09:50:00", ""),
+    ):
+        database.upsert_gate_pass(
+            {
+                **base,
+                "gate_key": f"20260924:{sequence}:PASS{sequence}",
+                "gate_pass_no": f"PASS{sequence}",
+                "sequence_no": sequence,
+                "container_no": container,
+                "planned_departure_at": planned,
+                "actual_departure_at": actual,
+            }
+        )
+
+    rows = database.pending_gate_departures("2026-09-24", "QingLong.Lin")
+
+    assert [row["container_no"] for row in rows] == [
+        "CAJU6050344",
+        "MSCU6639870",
+    ]
+    assert rows[0]["product_type"] == "空调"
+    assert rows[1]["product_type"] == ""
+    assert not any(row["acknowledged"] for row in rows)
+    assert database.acknowledge_gate_notice(
+        "QingLong.Lin", rows[0]["gate_key"], rows[0]["planned_departure_at"]
+    )
+    refreshed = database.pending_gate_departures("2026-09-24", "qinglong.lin")
+    assert refreshed[0]["acknowledged"] == 1
+    assert database.pending_gate_departures("2026-09-24", "another.user")[0][
+        "acknowledged"
+    ] == 0
 
 
 def test_ocr_backlog_contains_only_unprocessed_recent_completed_records(tmp_path):

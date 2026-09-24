@@ -52,3 +52,57 @@ def test_comparison_fields_marks_only_the_mismatched_value():
     )
 
     assert result == {"container_matches": True, "seal_matches": False}
+
+
+def test_pending_departure_ui_contract():
+    root = app_module.BASE_DIR
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    script = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="departure-search"' in markup
+    assert 'id="clear-departure-search"' in markup
+    assert 'id="departure-list"' in markup
+    assert 'addEventListener("dblclick"' in script
+    assert 'class="departure-product"' in script
+    assert 'setInterval(refreshPendingDepartures,60000)' in script
+    assert '"/api/gate/pending-departures/ack"' in script
+
+
+def test_application_icon_is_linked_and_contains_windows_sizes():
+    from PIL import Image
+
+    root = app_module.BASE_DIR
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    png_path = root / "static" / "assets" / "smartgpms-app.png"
+    ico_path = root / "static" / "assets" / "smartgpms-app.ico"
+
+    assert 'href="/static/assets/smartgpms-app.ico?v=1"' in markup
+    assert 'href="/static/assets/smartgpms-app.png?v=1"' in markup
+    with Image.open(png_path) as png:
+        assert png.size == (512, 512)
+    with Image.open(ico_path) as icon:
+        assert icon.format == "ICO"
+        assert (16, 16) in icon.info["sizes"]
+        assert (256, 256) in icon.info["sizes"]
+
+
+def test_photo_column_labels_use_business_wording():
+    root = app_module.BASE_DIR
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    script = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "<th>箱号照片</th>" in markup
+    assert "<th>铅封照片</th>" in markup
+    assert "<th>其他封箱照片</th>" in markup
+    assert 'noData("无其他封箱照片")' in script
+
+
+def test_left_panel_allocates_remaining_height_to_departure_list():
+    root = app_module.BASE_DIR
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'styles.css?v=0.12.3' in markup
+    assert ".input-panel>textarea{height:200px" in styles
+    assert ".departure-panel{display:flex;min-height:150px;flex:1 1 auto" in styles
+    assert ".departure-list{min-height:70px;max-height:none;flex:1 1 auto" in styles

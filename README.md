@@ -34,7 +34,13 @@ chmod +x setup.sh run.sh run_server.sh
 ./run.sh
 ```
 
-`setup.sh` 自动创建 `.venv`、安装 Python 依赖、Chromium 和 Linux 浏览器系统依赖。有图形桌面时，`run.sh` 会尝试打开应用窗口；无桌面时只运行服务。
+`setup.sh` 可从任意安装目录运行，并自动完成以下工作：
+
+- 在 Debian/Ubuntu 上通过 `sudo` 安装与当前 Python 版本匹配的 `venv`、基础工具和中文字体；
+- 自动修复上次安装失败遗留的不完整 `.venv`；
+- 安装 Python 依赖、Playwright Chromium 及其 Linux 系统依赖。
+
+有图形桌面时，`run.sh` 会尝试打开应用窗口；无桌面服务器建议直接运行 `run_server.sh`。其他 Linux 发行版需要先使用本机软件包管理器安装 Python 的 `venv/ensurepip`，随后仍可运行同一个 `setup.sh`。
 
 ## Linux/Windows 无界面服务端
 

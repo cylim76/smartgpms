@@ -16,6 +16,7 @@ from .ai_postprocess import (
     extract_seal_candidates,
     fuse_seal_candidates,
 )
+from .check_digit_fallback import apply_context_check_digit_fallback
 from .das_browser import DasBrowser
 from .database import Database, now_text
 from .recognition import RapidOCREngine, save_crop
@@ -268,6 +269,39 @@ class PhotoPipeline:
 
         if best_container is not None:
             container_photo_ids.add(int(best_container[-1]["id"]))
+            score, candidate, image, items, angle, row = best_container
+            if (
+                len(str(candidate.get("observed", ""))) == 10
+                and candidate.get("verification") == "unverified"
+            ):
+                with tempfile.TemporaryDirectory(
+                    dir=ocr_root, prefix=f"{Path(str(row['local_path'])).stem}_check_"
+                ) as fallback_name:
+                    fallback_work = Path(fallback_name)
+                    context_path = fallback_work / "context.jpg"
+                    save_crop(
+                        image,
+                        items,
+                        candidate["source_indices"],
+                        context_path,
+                        target_type="container",
+                        complete=False,
+                        source_rotation=angle,
+                    )
+                    with Image.open(context_path) as opened:
+                        context_image = opened.convert("RGB")
+                    recovered, postprocessing = apply_context_check_digit_fallback(
+                        context_image,
+                        candidate,
+                        self.engine,
+                        fallback_work,
+                    )
+                    context_image.close()
+                candidate = {
+                    **(recovered or candidate),
+                    "check_digit_postprocessing": postprocessing,
+                }
+                best_container = (score, candidate, image, items, angle, row)
         eligible_seals = {
             orientation: [
                 candidate
@@ -311,13 +345,20 @@ class PhotoPipeline:
             _score, value, image, items, angle, photo = selected
             original_stem = Path(str(photo["local_path"])).stem
             crop = ocr_root / f"{original_stem}_{target_type}_crop.jpg"
+            # A check digit recovered from the expanded context crop is not part of
+            # the original OCR box indices. Keep that wider evidence crop so the
+            # displayed image includes the digit that was actually re-read.
+            crop_complete = bool(value.get("complete")) and not (
+                target_type == "container"
+                and value.get("check_digit_source") == "context_ocr"
+            )
             save_crop(
                 image,
                 items,
                 value["source_indices"],
                 crop,
                 target_type=target_type,
-                complete=bool(value.get("complete")),
+                complete=crop_complete,
                 source_rotation=angle,
             )
             result = {
@@ -328,7 +369,7 @@ class PhotoPipeline:
                 "photo_id": photo["id"],
                 "engine_version": "rapidocr-3",
                 "model_version": "onnx-cpu",
-                "preprocessing_version": "das-photo-ai-orientation-fusion-v3",
+                "preprocessing_version": "das-photo-ai-check-digit-fallback-v4",
             }
             if target_type == "seal" and not result.get("confidence"):
                 result["confidence"] = float(result.get("similarity", 0))

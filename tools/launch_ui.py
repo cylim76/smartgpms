@@ -12,10 +12,13 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
 APP_URL = os.environ.get(
     "SMARTGPMS_UI_URL",
     f"http://127.0.0.1:{os.environ.get('SMARTGPMS_PORT', '8765')}",
 )
+DATA_DIR = Path(os.environ.get("SMARTGPMS_DATA_DIR") or ROOT / "data").resolve()
+UI_PROFILE_DIR = DATA_DIR / "ui-browser-profile"
 
 
 def _browser_candidates() -> list[Path]:
@@ -64,6 +67,63 @@ def _wait_until_ready(timeout_seconds: float = 45.0) -> bool:
     return False
 
 
+def _screen_size() -> tuple[int, int] | None:
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+        except (AttributeError, OSError):
+            return None
+    if sys.platform.startswith("linux") and os.environ.get("DISPLAY"):
+        try:
+            result = subprocess.run(
+                ["xdpyinfo"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            return None
+        for line in result.stdout.splitlines():
+            if "dimensions:" not in line:
+                continue
+            dimensions = line.split("dimensions:", 1)[1].strip().split()[0]
+            width, separator, height = dimensions.partition("x")
+            if separator and width.isdigit() and height.isdigit():
+                return int(width), int(height)
+    return None
+
+
+def _centered_window_args(
+    screen_size: tuple[int, int] | None,
+) -> list[str]:
+    if not screen_size:
+        return ["--start-maximized"]
+    screen_width, screen_height = screen_size
+    width = max(1024, round(screen_width * 0.9))
+    height = max(720, round(screen_height * 0.9))
+    width = min(width, screen_width)
+    height = min(height, screen_height)
+    left = max(0, (screen_width - width) // 2)
+    top = max(0, (screen_height - height) // 2)
+    return [f"--window-size={width},{height}", f"--window-position={left},{top}"]
+
+
+def _launch_arguments(browser: Path) -> list[str]:
+    arguments = [
+        str(browser),
+        f"--user-data-dir={UI_PROFILE_DIR}",
+        f"--app={APP_URL}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    arguments.extend(_centered_window_args(_screen_size()))
+    return arguments
+
+
 def main() -> None:
     if not _wait_until_ready():
         return
@@ -71,10 +131,8 @@ def main() -> None:
     if browser is None:
         webbrowser.open(APP_URL)
         return
-    subprocess.Popen(
-        [str(browser), f"--app={APP_URL}", "--start-maximized", "--no-first-run"],
-        close_fds=True,
-    )
+    UI_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(_launch_arguments(browser), close_fds=True)
 
 
 if __name__ == "__main__":

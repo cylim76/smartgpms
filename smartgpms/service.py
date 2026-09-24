@@ -385,6 +385,9 @@ class SmartGPMSService:
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%d %H:%M",
             "%Y-%m-%d",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+            "%Y/%m/%d",
             "%Y%m%d%H%M%S",
             "%Y%m%d",
         ):
@@ -400,6 +403,44 @@ class SmartGPMSService:
     def _normalized_gate_date(cls, value: str) -> str:
         parsed = cls._parsed_gate_datetime(value)
         return parsed.strftime("%Y-%m-%d") if parsed else ""
+
+    def pending_gate_departures(
+        self, username: str, current: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        current = current or business_now()
+        rows = self.database.pending_gate_departures(
+            current.strftime("%Y-%m-%d"), username
+        )
+        candidates: list[tuple[datetime, dict[str, Any]]] = []
+        for row in rows:
+            planned = self._parsed_gate_datetime(
+                str(row.get("planned_departure_at", ""))
+            )
+            if planned is None or planned.date() != current.date():
+                continue
+            candidates.append((planned, row))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        output: list[dict[str, Any]] = []
+        seen_containers: set[str] = set()
+        recent_cutoff = current - timedelta(minutes=30)
+        for planned, row in candidates:
+            container_no = str(row.get("container_no", "")).strip().upper()
+            if not container_no or container_no in seen_containers:
+                continue
+            seen_containers.add(container_no)
+            output.append(
+                {
+                    "gate_key": str(row.get("gate_key", "")),
+                    "container_no": container_no,
+                    "product_type": str(row.get("product_type", "")).strip(),
+                    "planned_departure_at": str(
+                        row.get("planned_departure_at", "")
+                    ),
+                    "is_new": planned > recent_cutoff
+                    and not bool(row.get("acknowledged")),
+                }
+            )
+        return output
 
     @classmethod
     def _gate_record(cls, row: dict[str, Any]) -> dict[str, Any]:

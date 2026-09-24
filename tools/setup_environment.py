@@ -24,6 +24,31 @@ def _run(command: list[str]) -> None:
     subprocess.run(command, cwd=ROOT, check=True)
 
 
+def _venv_ready() -> bool:
+    python = _venv_python()
+    if not python.is_file():
+        return False
+    return (
+        subprocess.run(
+            [str(python), "-m", "pip", "--version"],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def _create_or_repair_venv() -> None:
+    command = [sys.executable, "-m", "venv"]
+    if VENV_DIR.exists():
+        print("检测到未完成的虚拟环境，正在自动修复。", flush=True)
+        command.append("--clear")
+    command.append(str(VENV_DIR))
+    _run(command)
+
+
 def _windows_edge_available() -> bool:
     suffix = Path("Microsoft/Edge/Application/msedge.exe")
     return any(
@@ -65,8 +90,8 @@ def main() -> int:
     args = parser.parse_args()
     if not (sys.platform.startswith("win") or sys.platform.startswith("linux")):
         raise SystemExit(f"暂不支持当前系统：{platform.system()}")
-    if not _venv_python().is_file():
-        _run([sys.executable, "-m", "venv", str(VENV_DIR)])
+    if not _venv_ready():
+        _create_or_repair_venv()
     python = _venv_python()
     _run([str(python), "-m", "pip", "install", "--upgrade", "pip"])
     _run([str(python), "-m", "pip", "install", "-r", str(ROOT / "requirements.txt")])

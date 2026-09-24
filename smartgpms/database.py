@@ -170,6 +170,14 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_gate_application_date
                     ON gate_passes(application_date);
 
+                CREATE TABLE IF NOT EXISTS gate_notice_ack (
+                    username TEXT NOT NULL,
+                    gate_key TEXT NOT NULL,
+                    planned_departure_at TEXT NOT NULL,
+                    acknowledged_at TEXT NOT NULL,
+                    PRIMARY KEY(username, gate_key, planned_departure_at)
+                );
+
                 CREATE TABLE IF NOT EXISTS app_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL,
@@ -344,7 +352,9 @@ class Database:
             ).fetchone()
         return str(row["value"]) if row else default
 
-    def activate_ocr_pipeline(self, version: str) -> int:
+    def activate_ocr_pipeline(
+        self, version: str, *, incomplete_container_only: bool = False
+    ) -> int:
         """Invalidate derived OCR once when preprocessing rules change."""
         timestamp = now_text()
         with self.transaction() as connection:
@@ -353,10 +363,22 @@ class Database:
             ).fetchone()
             if current and str(current["value"]) == version:
                 return 0
-            cursor = connection.execute(
-                """UPDATE cpm_records SET ocr_status='pending'
-                   WHERE ocr_status IN ('ready','review','complete','processing','failed')"""
-            )
+            if incomplete_container_only:
+                cursor = connection.execute(
+                    """UPDATE cpm_records SET ocr_status='pending'
+                       WHERE ocr_status IN ('ready','review','complete','processing','failed')
+                         AND cpm_id IN (
+                             SELECT cpm_id FROM ocr_cache
+                             WHERE target_type='container'
+                               AND cache_status='ready'
+                               AND LENGTH(observed_text)=10
+                         )"""
+                )
+            else:
+                cursor = connection.execute(
+                    """UPDATE cpm_records SET ocr_status='pending'
+                       WHERE ocr_status IN ('ready','review','complete','processing','failed')"""
+                )
             connection.execute(
                 """INSERT INTO app_settings(key,value,updated_at) VALUES('ocr_pipeline_version',?,?)
                    ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at""",
@@ -524,6 +546,77 @@ class Database:
                 (container_no.upper(),),
             ).fetchone()
         return self._row(row)
+
+    def pending_gate_departures(
+        self, business_date: str, username: str
+    ) -> list[dict[str, Any]]:
+        compact_date = business_date.replace("-", "")
+        slash_date = business_date.replace("-", "/")
+        normalized_username = username.strip().lower()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT g.*,
+                          COALESCE((
+                              SELECT c.product_type FROM cpm_records c
+                              WHERE c.container_no=g.container_no AND c.is_valid=1
+                              ORDER BY CASE WHEN c.photo_count>0 OR c.downloaded_photo_count>0 THEN 1 ELSE 0 END DESC,
+                                       CASE WHEN c.archive_status=5 OR c.das_process_status=5 THEN 1 ELSE 0 END DESC,
+                                       CAST(c.cpm_id AS INTEGER) DESC, c.cpm_id DESC
+                              LIMIT 1
+                          ), '') AS product_type,
+                          CASE WHEN EXISTS (
+                              SELECT 1 FROM gate_notice_ack a
+                              WHERE a.username=? AND a.gate_key=g.gate_key
+                                AND a.planned_departure_at=g.planned_departure_at
+                          ) THEN 1 ELSE 0 END AS acknowledged
+                   FROM gate_passes g
+                   WHERE TRIM(g.actual_departure_at) IN ('', '-')
+                     AND (
+                         g.planned_departure_at LIKE ?
+                         OR g.planned_departure_at LIKE ?
+                         OR g.planned_departure_at LIKE ?
+                     )
+                   ORDER BY g.planned_departure_at DESC,
+                            CASE WHEN g.sequence_no GLOB '[0-9]*'
+                                 THEN CAST(g.sequence_no AS INTEGER) ELSE 0 END DESC,
+                            g.gate_pass_no DESC""",
+                (
+                    normalized_username,
+                    f"{business_date}%",
+                    f"{compact_date}%",
+                    f"{slash_date}%",
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def acknowledge_gate_notice(
+        self, username: str, gate_key: str, planned_departure_at: str
+    ) -> bool:
+        normalized_username = username.strip().lower()
+        if not normalized_username or not gate_key or not planned_departure_at:
+            return False
+        with self.connect() as connection:
+            exists = connection.execute(
+                """SELECT 1 FROM gate_passes
+                   WHERE gate_key=? AND planned_departure_at=?""",
+                (gate_key, planned_departure_at),
+            ).fetchone()
+            if not exists:
+                return False
+            connection.execute(
+                """INSERT INTO gate_notice_ack(
+                       username,gate_key,planned_departure_at,acknowledged_at
+                   ) VALUES(?,?,?,?)
+                   ON CONFLICT(username,gate_key,planned_departure_at)
+                   DO UPDATE SET acknowledged_at=excluded.acknowledged_at""",
+                (
+                    normalized_username,
+                    gate_key,
+                    planned_departure_at,
+                    now_text(),
+                ),
+            )
+        return True
 
     def mark_gate_pdf_ready(self, gate_key: str, path: str) -> None:
         with self.connect() as connection:

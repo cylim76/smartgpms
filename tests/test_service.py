@@ -701,6 +701,64 @@ def test_gate_sync_selects_latest_plan_and_queues_pdf(tmp_path):
         service.stop()
 
 
+def test_pending_gate_departures_prefers_latest_plan_and_marks_recent_new(tmp_path):
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    common = {
+        "application_date": "2026-09-24",
+        "seal_no": "SEAL1",
+        "actual_departure_at": "",
+    }
+    try:
+        database.upsert_cpm(
+            {
+                "cpm_id": "100",
+                "container_no": "MSCU6639870",
+                "product_type": "微波炉",
+                "business_stage": 4,
+            }
+        )
+        for sequence, container, planned in (
+            ("1", "MSCU6639870", "2026-09-24 09:00:00"),
+            ("2", "MSCU6639870", "2026-09-24 09:50:00"),
+            ("3", "CAJU6050344", "2026-09-24 09:20:00"),
+        ):
+            database.upsert_gate_pass(
+                service._gate_record(
+                    {
+                        **common,
+                        "sequence_no": sequence,
+                        "gate_pass_no": f"PASS{sequence}",
+                        "container_no": container,
+                        "planned_departure_at": planned,
+                    }
+                )
+            )
+
+        current = datetime.fromisoformat("2026-09-24T10:00:00+08:00")
+        rows = service.pending_gate_departures("QingLong.Lin", current)
+
+        assert [row["container_no"] for row in rows] == [
+            "MSCU6639870",
+            "CAJU6050344",
+        ]
+        assert rows[0]["planned_departure_at"] == "2026-09-24 09:50:00"
+        assert rows[0]["product_type"] == "微波炉"
+        assert rows[0]["is_new"] is True
+        assert rows[1]["is_new"] is False
+
+        assert database.acknowledge_gate_notice(
+            "QingLong.Lin", rows[0]["gate_key"], rows[0]["planned_departure_at"]
+        )
+        assert not service.pending_gate_departures("qinglong.lin", current)[0]["is_new"]
+    finally:
+        service.stop()
+
+
 def test_gatepass_pdf_name_uses_planned_departure_timestamp(tmp_path):
     service = SmartGPMSService(
         AppConfig(tmp_path),

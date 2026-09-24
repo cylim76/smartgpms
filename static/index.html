@@ -4,7 +4,10 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>smartGPMS 门证核验</title>
-  <link rel="stylesheet" href="/static/styles.css?v=0.11.1">
+  <link rel="icon" href="/static/assets/smartgpms-app.ico?v=1" sizes="any">
+  <link rel="icon" type="image/png" href="/static/assets/smartgpms-app.png?v=1">
+  <link rel="apple-touch-icon" href="/static/assets/smartgpms-app.png?v=1">
+  <link rel="stylesheet" href="/static/styles.css?v=0.12.3">
 </head>
 <body>
   <header class="topbar">
@@ -18,6 +21,11 @@
       <textarea id="containers" spellcheck="false" placeholder="例如：&#10;MSCU1234566&#10;TGHU7654321"></textarea>
       <div class="input-meta"><span id="input-count">0 个箱号</span><button id="clear-input" class="text-button">清空</button></div>
       <button id="verify" class="primary">识别并核验</button>
+      <section class="departure-panel" aria-labelledby="departure-title">
+        <div class="departure-heading"><strong id="departure-title">今日待出厂</strong><span id="departure-count">0 箱</span></div>
+        <div class="departure-filter"><input id="departure-search" type="text" autocomplete="off" placeholder="筛选箱号"><button id="clear-departure-search" type="button">清空</button></div>
+        <div id="departure-list" class="departure-list"><div class="departure-empty">暂无待出厂箱号</div></div>
+      </section>
       <div class="local-note"><span>RapidOCR + ONNX CPU</span></div>
     </aside>
 
@@ -39,15 +47,15 @@
 
       <section id="results" class="hidden">
         <div class="result-heading">
-          <div><div class="eyebrow">核验结果</div><h2>门证/监装照片核对</h2></div>
+          <h2>门证/监装照片核对</h2>
           <div class="legend"><span class="green">一致</span><span class="red">不一致</span><span class="orange">待确认</span></div>
         </div>
         <div class="table-shell">
           <table>
-            <thead><tr><th>打印</th><th>状态</th><th>门证箱号</th><th>门证铅封号</th><th>照片箱号区域 / OCR</th><th>照片铅封区域 / OCR</th><th>其他四阶段照片</th><th>最后打印时间</th></tr></thead>
+            <thead><tr><th>打印</th><th>状态</th><th>门证箱号</th><th>门证铅封号</th><th>箱号照片</th><th>铅封照片</th><th>其他封箱照片</th><th>最后打印时间</th></tr></thead>
             <tbody id="rows"></tbody>
           </table>
-          <div id="empty" class="empty"><div class="empty-icon">▦</div><strong>等待核验</strong><span>输入箱号后，系统会从 DAS 获取门证字段和四阶段照片。</span></div>
+          <div id="empty" class="empty"><div class="empty-icon">▦</div><strong>等待核验</strong></div>
         </div>
         <section class="activity-panel">
           <div class="activity-title"><strong>运行日志</strong><span id="activity-state">等待任务</span></div>
@@ -79,7 +87,7 @@
     </section>
   </div>
   <div id="toast" role="status"></div>
-  <script src="/static/app.js?v=0.11.1"></script>
-  <script src="/static/local-first.js?v=0.11.1"></script>
+  <script src="/static/app.js?v=0.12.2"></script>
+  <script src="/static/local-first.js?v=0.12.2"></script>
 </body>
 </html>

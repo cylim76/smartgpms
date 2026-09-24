@@ -30,7 +30,9 @@ STATIC_DIR = BASE_DIR / "static"
 DATA_DIR = Path(os.environ.get("SMARTGPMS_DATA_DIR", BASE_DIR / "data")).resolve()
 config = AppConfig(BASE_DIR, data_root=DATA_DIR)
 database = Database(DATA_DIR / "smartgpms.sqlite3")
-database.activate_ocr_pipeline("das-photo-ai-orientation-fusion-v3")
+database.activate_ocr_pipeline(
+    "das-photo-ai-check-digit-fallback-v4", incomplete_container_only=True
+)
 credentials = CredentialStore(DATA_DIR / "credentials.json")
 service = SmartGPMSService(config, database, credentials)
 pending_prints: dict[str, dict[str, Any]] = {}
@@ -45,7 +47,7 @@ async def lifespan(_: FastAPI):
     service.stop()
 
 
-app = FastAPI(title="smartGPMS", version="0.11.1", lifespan=lifespan)
+app = FastAPI(title="smartGPMS", version="0.12.3", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -62,6 +64,11 @@ class VerifyPayload(BaseModel):
 
 class GateVerifyPayload(BaseModel):
     container: str
+
+
+class GateNoticeAckPayload(BaseModel):
+    gate_key: str
+    planned_departure_at: str
 
 
 class PrintPayload(BaseModel):
@@ -85,6 +92,16 @@ def _clean_numbers(values: list[str]) -> list[str]:
             if number and number not in output:
                 output.append(number)
     return output
+
+
+def _logged_in_username() -> str:
+    session_state = database.session()
+    if session_state.get("status") != "logged_in":
+        raise HTTPException(status_code=401, detail="请先登录 SSO")
+    username = str(session_state.get("username", "")).strip()
+    if not username:
+        raise HTTPException(status_code=401, detail="当前登录用户信息无效")
+    return username
 
 
 def _public_ocr(
@@ -303,6 +320,28 @@ def sync_now():
 @app.get("/api/activity")
 def activity(after: int = 0):
     return service.activity(max(0, after))
+
+
+@app.get("/api/gate/pending-departures")
+def pending_gate_departures():
+    username = _logged_in_username()
+    return {
+        "rows": service.pending_gate_departures(username),
+        "refreshed_at": business_now().isoformat(timespec="seconds"),
+    }
+
+
+@app.post("/api/gate/pending-departures/ack")
+def acknowledge_gate_departure(payload: GateNoticeAckPayload):
+    username = _logged_in_username()
+    acknowledged = database.acknowledge_gate_notice(
+        username,
+        payload.gate_key.strip(),
+        payload.planned_departure_at.strip(),
+    )
+    if not acknowledged:
+        raise HTTPException(status_code=404, detail="待出厂门证记录已更新，请刷新列表")
+    return {"ok": True}
 
 
 @app.post("/api/verify")
