@@ -111,9 +111,48 @@ class PhotoPipeline:
         detail: dict[str, Any],
         progress: Callable[[str, str], None] | None = None,
     ) -> dict[str, Any]:
+        """Download through DAS first, then run the local CPU-only OCR stage."""
+        self.download(cpm_id, detail, progress)
+        return self.recognize(cpm_id, detail, progress)
+
+    def download(
+        self,
+        cpm_id: str,
+        detail: dict[str, Any],
+        progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Persist DAS originals and thumbnails without invoking OCR."""
+        self.database.update_ocr_status(cpm_id, "downloading")
+        try:
+            result = self._process(
+                cpm_id,
+                detail,
+                progress,
+                download_only=True,
+                allow_download=True,
+            )
+            self.database.update_ocr_status(cpm_id, "queued")
+            return result
+        except Exception:
+            self.database.update_ocr_status(cpm_id, "failed")
+            raise
+
+    def recognize(
+        self,
+        cpm_id: str,
+        detail: dict[str, Any],
+        progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Run crop/orientation/OCR using only already-downloaded local files."""
         self.database.update_ocr_status(cpm_id, "processing")
         try:
-            return self._process(cpm_id, detail, progress)
+            return self._process(
+                cpm_id,
+                detail,
+                progress,
+                download_only=False,
+                allow_download=False,
+            )
         except Exception:
             self.database.update_ocr_status(cpm_id, "failed")
             raise
@@ -123,6 +162,9 @@ class PhotoPipeline:
         cpm_id: str,
         detail: dict[str, Any],
         progress: Callable[[str, str], None] | None = None,
+        *,
+        download_only: bool = False,
+        allow_download: bool = True,
     ) -> dict[str, Any]:
         expected_container = str(detail.get("container_no", ""))
         safe_container = "".join(
@@ -194,6 +236,10 @@ class PhotoPipeline:
                     source = cached_path
                     row = cached
             else:
+                if not allow_download:
+                    raise RuntimeError(
+                        f"本地原图缺失，不能进入独立 OCR 阶段：{filename}"
+                    )
                 if progress:
                     progress(
                         "download",
@@ -225,6 +271,8 @@ class PhotoPipeline:
                         "cache_status": "ready",
                     },
                 )
+            if download_only:
+                continue
             if progress:
                 progress("ocr", f"RapidOCR 识别照片 {photo_index}/{total_photos}")
             with tempfile.TemporaryDirectory(
@@ -266,6 +314,27 @@ class PhotoPipeline:
                         seal_candidates.setdefault(orientation, []).append(
                             {**seal, "_run_key": run_key}
                         )
+
+        downloaded_count = sum(
+            1
+            for row in self.database.photos_for_cpm(cpm_id)
+            if int(row.get("step_no", 0)) == 4
+            and row.get("cache_status") == "ready"
+            and self._safe_cache_file(str(row.get("local_path", ""))) is not None
+        )
+        self.database.update_photo_inventory(cpm_id, total_photos, downloaded_count)
+        if has_stage4 and total_photos >= 3 and downloaded_count >= 3:
+            self.database.mark_archive_status(cpm_id, 5)
+        elif has_stage4:
+            self.database.mark_archive_status(
+                cpm_id, min(4, int(detail.get("business_stage", 4)))
+            )
+        if download_only:
+            return {
+                "status": "queued",
+                "available_photo_count": total_photos,
+                "downloaded_photo_count": downloaded_count,
+            }
 
         if best_container is not None:
             container_photo_ids.add(int(best_container[-1]["id"]))
@@ -322,21 +391,6 @@ class PhotoPipeline:
                 items,
                 angle,
                 row,
-            )
-
-        downloaded_count = sum(
-            1
-            for row in self.database.photos_for_cpm(cpm_id)
-            if int(row.get("step_no", 0)) == 4
-            and row.get("cache_status") == "ready"
-            and self._safe_cache_file(str(row.get("local_path", ""))) is not None
-        )
-        self.database.update_photo_inventory(cpm_id, total_photos, downloaded_count)
-        if has_stage4 and total_photos >= 3 and downloaded_count >= 3:
-            self.database.mark_archive_status(cpm_id, 5)
-        elif has_stage4:
-            self.database.mark_archive_status(
-                cpm_id, min(4, int(detail.get("business_stage", 4)))
             )
 
         def persist(target_type: str, selected):

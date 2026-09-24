@@ -547,6 +547,25 @@ class Database:
             ).fetchone()
         return self._row(row)
 
+    def mark_gate_departed(self, gate_key: str, actual_departure_at: str) -> bool:
+        """Record departure without changing cached gate content or PDF state."""
+        timestamp = now_text()
+        with self.transaction() as connection:
+            cursor = connection.execute(
+                """UPDATE gate_passes
+                   SET actual_departure_at=?,last_seen_at=?,last_checked_at=?
+                   WHERE gate_key=?""",
+                (actual_departure_at, timestamp, timestamp, gate_key),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    """UPDATE background_jobs
+                       SET status='cancelled',last_error='门证已实际出厂，取消自动下载',updated_at=?
+                       WHERE job_type='gate_pdf' AND cpm_id=? AND status='pending'""",
+                    (timestamp, gate_key),
+                )
+        return bool(cursor.rowcount)
+
     def pending_gate_departures(
         self, business_date: str, username: str
     ) -> list[dict[str, Any]]:

@@ -18,5 +18,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo Installation complete. Run run.bat to start smartGPMS.
+echo Installation complete.
+echo Local mode: run_win.bat
+echo Windows service mode: install_service.bat
 pause

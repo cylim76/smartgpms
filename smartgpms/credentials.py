@@ -146,7 +146,13 @@ class CredentialStore:
             if dpapi_value:
                 if self.platform_name != "nt":
                     return username, ""
-                return username, _windows_unprotect(dpapi_value)
+                try:
+                    return username, _windows_unprotect(dpapi_value)
+                except OSError:
+                    # Desktop and Windows-service modes use different DPAPI
+                    # identities. Preserve the username but require the current
+                    # identity to save its own encrypted password.
+                    return username, ""
             if fernet_value:
                 try:
                     password = self._fernet().decrypt(fernet_value.encode("ascii"))

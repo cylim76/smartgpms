@@ -5,15 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=smartgpms
-Group=smartgpms
-WorkingDirectory=/opt/smartgpms
-Environment=SMARTGPMS_DATA_DIR=/var/lib/smartgpms
-Environment=SMARTGPMS_HOST=127.0.0.1
-Environment=SMARTGPMS_PORT=8765
-ExecStart=/opt/smartgpms/.venv/bin/python -m uvicorn app:app --host ${SMARTGPMS_HOST} --port ${SMARTGPMS_PORT} --workers 1
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@WORKING_DIRECTORY@
+Environment="SMARTGPMS_DATA_DIR=@DATA_DIRECTORY@"
+Environment="SMARTGPMS_RUN_MODE=server"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart="@PYTHON_EXECUTABLE@" -m uvicorn app:app --host "@HOST@" --port @PORT@ --workers 1
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=120
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

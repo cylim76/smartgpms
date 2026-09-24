@@ -1,9 +1,13 @@
+import threading
+import time
 from datetime import datetime
+
+import pytest
 
 from smartgpms.config import AppConfig
 from smartgpms.credentials import CredentialStore
 from smartgpms.database import Database
-from smartgpms.service import SmartGPMSService
+from smartgpms.service import ServiceStopping, SmartGPMSService
 from smartgpms.time_utils import business_now
 
 TODAY = business_now().strftime("%Y-%m-%d 08:00:00")
@@ -480,6 +484,130 @@ def test_background_schedule_runs_only_from_0700_through_2359():
     )
 
 
+def test_gate_and_photo_sync_use_independent_default_intervals(tmp_path):
+    config = AppConfig(tmp_path)
+
+    assert config.gate_sync_interval_seconds == 10 * 60
+    assert config.photo_sync_interval_seconds == 20 * 60
+    assert config.photo_scan_batch_size == 20
+
+
+def test_photo_scan_yields_to_gate_checkpoint_every_configured_batch(tmp_path):
+    config = AppConfig(
+        tmp_path,
+        startup_snapshot_size=5,
+        photo_scan_batch_size=2,
+    )
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    service = SmartGPMSService(
+        config,
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+
+    class BatchBrowser:
+        @staticmethod
+        def cpm_snapshot(_limit):
+            return [{"cpm_id": "105", "begin_date": TODAY}]
+
+        @staticmethod
+        def fetch_cpm_detail(cpm_id, _refresh):
+            return {
+                "cpm_id": cpm_id,
+                "container_no": f"TEST{cpm_id}",
+                "begin_date": TODAY,
+                "business_stage": 1,
+                "das_process_status": 1,
+                "photos": [],
+            }
+
+        @staticmethod
+        def close():
+            return None
+
+    checkpoints = []
+    service.browser = BatchBrowser()
+    try:
+        result = service.sync_latest_window(
+            gate_checkpoint=lambda: checkpoints.append(database.cpm_record_count())
+        )
+
+        assert result["scanned"] == 5
+        assert checkpoints == [2, 4]
+    finally:
+        service.stop()
+
+
+def test_background_ocr_uses_separate_cpu_worker_after_serial_download(tmp_path):
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    database.enqueue_job("download_ocr", "100715")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    ocr_started = threading.Event()
+    release_ocr = threading.Event()
+    worker_names = {}
+
+    class JobBrowser:
+        @staticmethod
+        def fetch_cpm_detail(cpm_id):
+            worker_names["query"] = threading.current_thread().name
+            return {
+                "cpm_id": cpm_id,
+                "das_process_status": 5,
+                "photos": [{"step_no": 4, "source_url": "http://das/photo.jpg"}],
+            }
+
+        @staticmethod
+        def close():
+            return None
+
+    class JobPhotos:
+        @staticmethod
+        def download(_cpm_id, _detail):
+            worker_names["download"] = threading.current_thread().name
+            return {"downloaded_photo_count": 3}
+
+        @staticmethod
+        def recognize(_cpm_id, _detail):
+            worker_names["ocr"] = threading.current_thread().name
+            ocr_started.set()
+            release_ocr.wait(timeout=2)
+            return {"downloaded_photo_count": 3}
+
+    service.browser = JobBrowser()
+    service.photos = JobPhotos()
+    try:
+        assert service.run_one_job()
+        assert ocr_started.wait(timeout=2)
+        assert worker_names["query"].startswith("smartgpms-browser")
+        assert worker_names["download"].startswith("smartgpms-browser")
+        assert worker_names["ocr"].startswith("smartgpms-ocr")
+        with database.connect() as connection:
+            assert (
+                connection.execute(
+                    "SELECT status FROM background_jobs WHERE cpm_id='100715'"
+                ).fetchone()["status"]
+                == "running"
+            )
+        release_ocr.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with database.connect() as connection:
+                status = connection.execute(
+                    "SELECT status FROM background_jobs WHERE cpm_id='100715'"
+                ).fetchone()["status"]
+            if status == "done":
+                break
+            time.sleep(0.01)
+        assert status == "done"
+    finally:
+        release_ocr.set()
+        service.stop()
+
+
 def test_background_job_logs_actual_completed_original_count(tmp_path):
     database = Database(tmp_path / "data" / "test.sqlite3")
     database.enqueue_job("download_ocr", "100715")
@@ -504,20 +632,29 @@ def test_background_job_logs_actual_completed_original_count(tmp_path):
 
     class JobPhotos:
         @staticmethod
-        def process(_cpm_id, _detail):
+        def download(_cpm_id, _detail):
+            return {"downloaded_photo_count": 3}
+
+        @staticmethod
+        def recognize(_cpm_id, _detail):
             return {"downloaded_photo_count": 3}
 
     service.browser = JobBrowser()
     service.photos = JobPhotos()
     try:
         assert service.run_one_job()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with database.connect() as connection:
+                status = connection.execute(
+                    "SELECT status FROM background_jobs WHERE cpm_id='100715'"
+                ).fetchone()["status"]
+            if status == "done":
+                break
+            time.sleep(0.01)
         assert service.activity()["entries"][-1]["message"].endswith(
             "监装照片下载与文字识别完成：原图 3 张"
         )
-        with database.connect() as connection:
-            status = connection.execute(
-                "SELECT status FROM background_jobs WHERE cpm_id='100715'"
-            ).fetchone()["status"]
         assert status == "done"
     finally:
         service.stop()
@@ -688,6 +825,7 @@ def test_gate_sync_selects_latest_plan_and_queues_pdf(tmp_path):
             "scanned": 2,
             "new": 2,
             "updated": 0,
+            "departed": 0,
             "queued": 2,
             "busy": False,
         }
@@ -697,6 +835,112 @@ def test_gate_sync_selects_latest_plan_and_queues_pdf(tmp_path):
                 "SELECT COUNT(*) AS value FROM background_jobs WHERE job_type='gate_pdf'"
             ).fetchone()["value"]
         assert count == 2
+    finally:
+        service.stop()
+
+
+def test_gate_sync_excludes_departed_rows_and_cancels_cached_pdf_work(tmp_path):
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    active_row = {
+        "application_date": "2026-09-24",
+        "container_no": "MSCU6639870",
+        "seal_no": "SEAL1",
+        "gate_pass_no": "PASS1",
+        "sequence_no": "1",
+        "planned_departure_at": "2026-09-24 09:00:00",
+        "actual_departure_at": "",
+    }
+    record = service._gate_record(active_row)
+    database.upsert_gate_pass(record)
+    cached_pdf = tmp_path / "gate.pdf"
+    cached_pdf.write_bytes(b"pdf")
+    database.mark_gate_pdf_ready(record["gate_key"], str(cached_pdf))
+    database.enqueue_job("gate_pdf", record["gate_key"])
+
+    class GateBrowser:
+        @staticmethod
+        def gate_pass_snapshot(_date_value):
+            return [
+                {
+                    **active_row,
+                    "actual_departure_at": "2026-09-24 10:15:00",
+                },
+                {
+                    **active_row,
+                    "container_no": "CAJU6050344",
+                    "gate_pass_no": "PASS2",
+                    "sequence_no": "2",
+                    "actual_departure_at": "2026-09-24 10:20:00",
+                },
+            ]
+
+        @staticmethod
+        def close():
+            return None
+
+    service.browser = GateBrowser()
+    try:
+        result = service.sync_gate_passes(
+            datetime.fromisoformat("2026-09-24T11:00:00+08:00")
+        )
+
+        assert result == {
+            "scanned": 0,
+            "new": 0,
+            "updated": 0,
+            "departed": 2,
+            "queued": 0,
+            "busy": False,
+        }
+        saved = database.gate_pass_by_key(record["gate_key"])
+        assert saved["actual_departure_at"] == "2026-09-24 10:15:00"
+        assert saved["source_fingerprint"] == record["source_fingerprint"]
+        assert saved["pdf_status"] == "ready"
+        assert saved["pdf_path"] == str(cached_pdf)
+        assert database.latest_gate_pass("CAJU6050344") is None
+        assert database.pending_gate_departures("2026-09-24", "operator") == []
+        with database.connect() as connection:
+            job = connection.execute(
+                "SELECT status FROM background_jobs WHERE job_type='gate_pdf' AND cpm_id=?",
+                (record["gate_key"],),
+            ).fetchone()
+        assert job["status"] == "cancelled"
+    finally:
+        service.stop()
+
+
+def test_stale_gate_pdf_job_is_cancelled_when_gate_has_departed(tmp_path):
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    record = service._gate_record(
+        {
+            "application_date": "2026-09-24",
+            "container_no": "MSCU6639870",
+            "gate_pass_no": "PASS1",
+            "sequence_no": "1",
+            "planned_departure_at": "2026-09-24 09:00:00",
+            "actual_departure_at": "2026-09-24 10:15:00",
+        }
+    )
+    database.upsert_gate_pass(record)
+    database.enqueue_job("gate_pdf", record["gate_key"])
+    try:
+        assert service.run_one_job()
+        with database.connect() as connection:
+            status = connection.execute(
+                "SELECT status FROM background_jobs WHERE job_type='gate_pdf' AND cpm_id=?",
+                (record["gate_key"],),
+            ).fetchone()["status"]
+        assert status == "cancelled"
     finally:
         service.stop()
 
@@ -828,4 +1072,92 @@ def test_gate_sync_requeues_pdf_when_cached_filename_is_outdated(tmp_path):
 
         assert result["queued"] == 1
     finally:
+        service.stop()
+
+
+def test_shutdown_finishes_current_job_but_does_not_claim_the_next(tmp_path):
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    database.enqueue_job("download_ocr", "1")
+    database.enqueue_job("download_ocr", "2")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+
+    class JobBrowser:
+        @staticmethod
+        def fetch_cpm_detail(cpm_id):
+            return {
+                "cpm_id": cpm_id,
+                "das_process_status": 5,
+                "photos": [{"step_no": 4, "source_url": "http://das/photo.jpg"}],
+            }
+
+        @staticmethod
+        def close():
+            return None
+
+    class JobPhotos:
+        @staticmethod
+        def download(_cpm_id, _detail):
+            return {"downloaded_photo_count": 3}
+
+        @staticmethod
+        def recognize(_cpm_id, _detail):
+            service.request_shutdown()
+            return {"downloaded_photo_count": 3}
+
+    service.browser = JobBrowser()
+    service.photos = JobPhotos()
+    try:
+        assert service.run_one_job()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not service.is_draining:
+            time.sleep(0.01)
+        assert not service.run_one_job()
+        with database.connect() as connection:
+            states = {
+                row["cpm_id"]: row["status"]
+                for row in connection.execute(
+                    "SELECT cpm_id,status FROM background_jobs"
+                ).fetchall()
+            }
+        assert states == {"1": "pending", "2": "done"}
+    finally:
+        service.stop()
+
+
+def test_graceful_shutdown_waits_for_running_foreground_task(tmp_path):
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        Database(tmp_path / "data" / "test.sqlite3"),
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    stopped = threading.Event()
+
+    def current_task():
+        started.set()
+        release.wait(timeout=5)
+
+    worker = threading.Thread(target=lambda: service.run_foreground(current_task))
+    worker.start()
+    assert started.wait(timeout=2)
+    shutdown = threading.Thread(
+        target=lambda: (service.drain_and_stop(), stopped.set())
+    )
+    shutdown.start()
+    try:
+        time.sleep(0.05)
+        assert not stopped.is_set()
+        with pytest.raises(ServiceStopping):
+            service.run_foreground(lambda: None)
+        release.set()
+        shutdown.join(timeout=5)
+        worker.join(timeout=5)
+        assert stopped.is_set()
+    finally:
+        release.set()
         service.stop()

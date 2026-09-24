@@ -1,0 +1,24 @@
+<service>
+  <id>smartGPMS</id>
+  <name>smartGPMS</name>
+  <description>smartGPMS 集装箱门证与监装照片智能核验服务</description>
+
+  <executable>%BASE%\..\.venv\Scripts\python.exe</executable>
+  <arguments>"%BASE%\..\tools\run_service.py"</arguments>
+  <workingdirectory>%BASE%\..</workingdirectory>
+  <hidewindow>true</hidewindow>
+
+  <env name="SMARTGPMS_RUN_MODE" value="server" />
+  <env name="SMARTGPMS_HOST" value="0.0.0.0" />
+  <env name="SMARTGPMS_PORT" value="8765" />
+  <env name="SMARTGPMS_DATA_DIR" value="%BASE%\..\data" />
+
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <stoptimeout>5 min</stoptimeout>
+  <onfailure action="restart" delay="10 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <logpath>%BASE%\..\data\service-logs</logpath>
+  <log mode="roll" />
+</service>

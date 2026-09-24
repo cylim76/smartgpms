@@ -18,3 +18,6 @@ data/ui-browser-profile/
 data/ui-smoke.png
 data/ui-results-smoke.png
 data/captured_*_dom.html
+data/service-logs/
+service/smartGPMS.exe
+service/smartGPMS.xml

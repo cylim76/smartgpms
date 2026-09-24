@@ -1,12 +1,13 @@
 # smartGPMS 开发方案
 
-版本：0.11
+版本：0.14.0
 
 ## Windows/Linux 双系统运行约束
 
 - 同一套 Python、前端和数据库代码支持 Windows 与 Linux；
-- Windows 保留 `setup.bat` / `run.bat`，Linux 使用对应 `.sh`；
+- Windows 本机模式使用 `setup_win.bat` / `run_win.bat`；Windows 服务模式仅使用 `install_service.bat` / `uninstall_service.bat`，由 WinSW 托管且不保留 `run_server.bat` 前台入口；Linux 由 `setup_linux.sh` 安装为 systemd 服务；
 - Windows 凭据继续使用 DPAPI，Linux 使用服务器本机 Fernet 密钥；
+- Windows 服务默认使用 `LocalSystem`，服务身份与桌面用户的 DPAPI 密钥隔离，切换模式后需重新保存一次登录密码；
 - Windows 后台浏览器优先使用 Edge，Linux 使用 Playwright Chromium；
 - Linux 无界面服务固定单 worker，避免重复创建 SSO 浏览器和后台同步任务；
 - 当前版本为单 SSO 会话，多用户会话隔离不属于本轮范围。
@@ -211,6 +212,7 @@ OCR 缓存键包含 `cpm_id + 照片 URL/哈希 + 引擎版本 + 模型版本 + 
 - 用户主动核验不受 30 天限制；本地没有箱号映射时先从门证打印页查询箱号并取得 CPMID，再按该 CPMID 下载照片。
 - 核验界面采用本地优先加载：已有照片、OCR 裁剪和缩略图先显示，门证箱号/铅封号随后从 DAS 实时补齐。门证数据不做长期预缓存，因为通常要等出厂当天由 GERP 发送到 DAS。
 - 后台 OCR 同步生成小尺寸列表缩略图并保存数据库路径；原图仍只用于点击放大和证据查看。
+- 监装记录扫描以 20 箱为一批，批次边界为到期的门证同步让出 DAS 浏览器；页面查询与原图下载始终串行。照片落盘后，裁剪、旋转和 RapidOCR 进入独立的单 CPU 线程，不占用 DAS 浏览器通道。
 - 本地不存在待核验箱号时，不扩大初始化窗口，也不从门证页面或新 CPMID 游标猜测映射；系统在 DAS 照片下载页面按箱号精确查询检查序号。多个检查序号按“有第四阶段照片优先、完成状态优先、CPMID 较大优先”选择，然后执行原有下载和 OCR 流程。
 - 自动同步和后台照片下载仅在本机时间 07:00–23:59 运行；00:00–06:59 暂停后台作业。人工核验不受后台时段限制。
 

@@ -8,7 +8,8 @@ import shutil
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,10 @@ from .time_utils import business_now
 
 LOGGER = logging.getLogger(__name__)
 ACTIVITY_RETENTION_SECONDS = 2 * 60 * 60
+
+
+class ServiceStopping(RuntimeError):
+    """Raised when new interactive work arrives during graceful shutdown."""
 
 
 class SmartGPMSService:
@@ -38,9 +43,19 @@ class SmartGPMSService:
         self._browser_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="smartgpms-browser"
         )
+        self._ocr_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="smartgpms-ocr"
+        )
+        self._ocr_job_lock = threading.Lock()
+        self._ocr_job_running = False
         self._stop = threading.Event()
+        self._drain_requested = threading.Event()
         self._thread: threading.Thread | None = None
         self._task_lock = threading.Lock()
+        self._stop_lock = threading.Lock()
+        self._foreground_condition = threading.Condition()
+        self._foreground_tasks = 0
+        self._closed = False
         self._activity_lock = threading.Lock()
         self._activity: deque[dict[str, Any]] = deque(maxlen=100)
         self._activity_seq = 0
@@ -95,6 +110,8 @@ class SmartGPMSService:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._drain_requested.clear()
+        self._closed = False
         removed_legacy = self.database.remove_legacy_import_artifacts()
         if removed_legacy:
             self.log_activity(
@@ -125,15 +142,79 @@ class SmartGPMSService:
         self._thread.start()
         self.log_activity("smartGPMS 已启动，等待 SSO / DAS 会话")
 
+    @property
+    def is_draining(self) -> bool:
+        return self._drain_requested.is_set()
+
+    def run_foreground(self, function, *args, **kwargs):
+        """Run one user request while making graceful shutdown wait for it."""
+        with self._foreground_condition:
+            if self._drain_requested.is_set():
+                raise ServiceStopping("smartGPMS 正在安全退出，请重新启动后再操作")
+            self._foreground_tasks += 1
+        try:
+            return function(*args, **kwargs)
+        finally:
+            with self._foreground_condition:
+                self._foreground_tasks -= 1
+                self._foreground_condition.notify_all()
+
+    def request_shutdown(self) -> None:
+        """Stop accepting new work; current foreground/background unit may finish."""
+        if self._drain_requested.is_set():
+            return
+        self._drain_requested.set()
+        self.log_activity(
+            "桌面窗口已关闭；正在完成当前箱号后安全退出",
+            source="shutdown",
+        )
+
+    def drain_and_stop(self, timeout: float = 300.0) -> None:
+        """Drain the current work unit, close DAS/SSO, then stop the service."""
+        self.request_shutdown()
+        deadline = time.monotonic() + timeout
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._foreground_condition:
+            while self._foreground_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    LOGGER.warning(
+                        "Graceful shutdown timed out with %s foreground task(s)",
+                        self._foreground_tasks,
+                    )
+                    break
+                self._foreground_condition.wait(timeout=remaining)
+        self.stop()
+
     def stop(self) -> None:
+        with self._stop_lock:
+            if self._closed:
+                return
+            self._closed = True
+        self._drain_requested.set()
         self._stop.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5)
-        self._browser_call(self.browser.close)
-        self._browser_executor.shutdown(wait=False)
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
+        try:
+            self._browser_call(self.browser.close)
+        finally:
+            self._browser_executor.shutdown(wait=True)
+            self._ocr_executor.shutdown(wait=True)
+        previous = self.database.session()
+        self.database.update_session(
+            "logged_out",
+            str(previous.get("username", "")),
+            "smartGPMS 服务已安全关闭",
+        )
 
     def _browser_call(self, function, *args, **kwargs):
         return self._browser_executor.submit(function, *args, **kwargs).result()
+
+    def _ocr_call(self, function, *args, **kwargs):
+        return self._ocr_executor.submit(function, *args, **kwargs).result()
 
     def login(
         self, username: str, password: str, otp: str, remember: bool
@@ -160,7 +241,11 @@ class SmartGPMSService:
             self.log_activity(f"登录失败：{exc}", "error", "login")
             raise
 
-    def sync_latest_window(self, limit: int | None = None) -> dict[str, Any]:
+    def sync_latest_window(
+        self,
+        limit: int | None = None,
+        gate_checkpoint: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
         """Discover new CPMIDs downward, then maintain only incomplete 30-day rows."""
         limit = limit or self.config.startup_snapshot_size
         if not self._task_lock.acquire(blocking=False):
@@ -201,6 +286,8 @@ class SmartGPMSService:
             reached_date_boundary = False
 
             while checked_ids < max_checks:
+                if self._drain_requested.is_set():
+                    break
                 if initializing and existing_count + len(new_ids) >= limit:
                     break
                 if not initializing and local_max is not None and candidate <= local_max:
@@ -248,8 +335,11 @@ class SmartGPMSService:
                 if self._schedule_photo_work(cpm_id, detail, saved):
                     counters["downloads"] += 1
                 self._log_sync_progress(mode, counters)
+                self._photo_scan_checkpoint(counters, gate_checkpoint)
 
             for current in self.database.numeric_cpm_records_desc():
+                if self._drain_requested.is_set():
+                    break
                 cpm_id = str(current["cpm_id"])
                 if cpm_id in new_ids:
                     continue
@@ -271,12 +361,14 @@ class SmartGPMSService:
                         )
                     counters["skipped"] += 1
                     self._log_sync_progress(mode, counters)
+                    self._photo_scan_checkpoint(counters, gate_checkpoint)
                     continue
                 if completed:
                     counters["downloads"] += int(
                         self.database.enqueue_job("download_ocr", cpm_id)
                     )
                     self._log_sync_progress(mode, counters)
+                    self._photo_scan_checkpoint(counters, gate_checkpoint)
                     continue
                 try:
                     detail = self._browser_call(
@@ -301,6 +393,7 @@ class SmartGPMSService:
                 if self._schedule_photo_work(cpm_id, detail, saved):
                     counters["downloads"] += 1
                 self._log_sync_progress(mode, counters)
+                self._photo_scan_checkpoint(counters, gate_checkpoint)
 
             if initializing and (
                 self.database.cpm_record_count() >= limit or reached_date_boundary
@@ -490,18 +583,33 @@ class SmartGPMSService:
             "source_fingerprint": fingerprint,
         }
 
-    def sync_gate_passes(self, current: datetime | None = None) -> dict[str, int | bool]:
+    def sync_gate_passes(
+        self,
+        current: datetime | None = None,
+        *,
+        _task_lock_owned: bool = False,
+    ) -> dict[str, int | bool]:
         """Synchronize gate passes planned for today and queue new/changed PDFs."""
-        if not self._task_lock.acquire(blocking=False):
-            return {"scanned": 0, "new": 0, "updated": 0, "queued": 0, "busy": True}
+        acquired = _task_lock_owned or self._task_lock.acquire(blocking=False)
+        if not acquired:
+            return {
+                "scanned": 0,
+                "new": 0,
+                "updated": 0,
+                "departed": 0,
+                "queued": 0,
+                "busy": True,
+            }
         current = current or business_now()
         date_value = current.strftime("%Y%m%d")
         today = current.strftime("%Y-%m-%d")
-        scanned = new = updated = queued = 0
+        scanned = new = updated = departed = queued = 0
         try:
             self.log_activity("正在同步今天的通门证", source="gate_sync")
             rows = self._browser_call(self.browser.gate_pass_snapshot, date_value)
             for row in rows:
+                if self._drain_requested.is_set():
+                    break
                 planned_date = self._normalized_gate_date(
                     str(row.get("planned_departure_at", ""))
                 )
@@ -509,6 +617,13 @@ class SmartGPMSService:
                     continue
                 record = self._gate_record(row)
                 if not record["container_no"]:
+                    continue
+                if self._gate_has_departed(record):
+                    self.database.mark_gate_departed(
+                        str(record["gate_key"]),
+                        str(record.get("actual_departure_at", "")),
+                    )
+                    departed += 1
                     continue
                 scanned += 1
                 previous, saved = self.database.upsert_gate_pass(record)
@@ -538,13 +653,14 @@ class SmartGPMSService:
             self.database.set_setting("gate_sync_completed_at", now_text())
             self.log_activity(
                 f"今天的通门证同步完成：扫描 {scanned} 箱 / 新增 {new} 箱 / "
-                f"更新 {updated} 箱 / PDF排队 {queued} 箱",
+                f"更新 {updated} 箱 / 已出厂排除 {departed} 箱 / PDF排队 {queued} 箱",
                 source="gate_sync",
             )
             return {
                 "scanned": scanned,
                 "new": new,
                 "updated": updated,
+                "departed": departed,
                 "queued": queued,
                 "busy": False,
             }
@@ -555,7 +671,8 @@ class SmartGPMSService:
             self.log_activity(f"通门证同步失败：{exc}", "error", "gate_sync")
             raise
         finally:
-            self._task_lock.release()
+            if not _task_lock_owned:
+                self._task_lock.release()
 
     def save_gate_detail(self, gate: dict[str, Any]) -> dict[str, Any]:
         record = self._gate_record(gate)
@@ -570,7 +687,7 @@ class SmartGPMSService:
             previous
             and previous.get("source_fingerprint") != saved.get("source_fingerprint")
         )
-        if planned_date == today and (
+        if not self._gate_has_departed(saved) and planned_date == today and (
             previous is None
             or changed
             or saved.get("pdf_status") != "ready"
@@ -579,6 +696,11 @@ class SmartGPMSService:
         ):
             self.database.enqueue_job("gate_pdf", str(saved["gate_key"]))
         return saved
+
+    @staticmethod
+    def _gate_has_departed(gate: dict[str, Any]) -> bool:
+        actual = str(gate.get("actual_departure_at", "")).strip()
+        return bool(actual and actual not in {"-", "--"})
 
     def gatepass_pdf_path(self, gate: dict[str, Any]) -> Path:
         planned = self._parsed_gate_datetime(
@@ -672,6 +794,20 @@ class SmartGPMSService:
             self.log_activity(
                 f"{mode}：{self._sync_summary(counters)}", source="sync"
             )
+
+    def _photo_scan_checkpoint(
+        self,
+        counters: dict[str, int],
+        gate_checkpoint: Callable[[], None] | None,
+    ) -> None:
+        """Yield to a due gate-pass sync between bounded photo scan batches."""
+        batch_size = max(1, self.config.photo_scan_batch_size)
+        if (
+            gate_checkpoint is not None
+            and counters["scanned"]
+            and counters["scanned"] % batch_size == 0
+        ):
+            gate_checkpoint()
 
     @staticmethod
     def _sync_result(
@@ -930,6 +1066,8 @@ class SmartGPMSService:
                 self.database.update_session("logged_out", message="DAS 会话已失效")
                 return {"checked": 0, "found": 0, "queued": 0, "errors": 1}
             for cpm_id in ids:
+                if self._drain_requested.is_set():
+                    break
                 checked += 1
                 try:
                     detail = self._browser_call(
@@ -993,6 +1131,8 @@ class SmartGPMSService:
         )
 
     def _queue_ocr_backlog(self, oldest_cpm_id: str | None = None) -> int:
+        if self._drain_requested.is_set():
+            return 0
         queued = 0
         for cpm_id in self.database.ocr_backlog_ids(
             oldest_cpm_id, self.config.startup_snapshot_size
@@ -1019,14 +1159,70 @@ class SmartGPMSService:
                 continue
         return False
 
+    def _finish_background_job(
+        self,
+        job: dict[str, Any],
+        status: str,
+        error: str = "",
+    ) -> None:
+        run_after = now_text()
+        attempts = int(job.get("attempts", 0)) + 1
+        if status == "pending":
+            delay = (60, 300, 900)[min(attempts - 1, 2)]
+            run_after = (
+                business_now() + timedelta(seconds=delay)
+            ).isoformat(timespec="seconds")
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE background_jobs SET status=?,last_error=?,run_after=?,updated_at=? WHERE id=?",
+                (status, error, run_after, now_text(), job["id"]),
+            )
+
+    def _complete_photo_ocr(
+        self,
+        job: dict[str, Any],
+        downloaded: dict[str, Any],
+        future: Future,
+    ) -> None:
+        try:
+            result = future.result()
+            count = int(
+                result.get(
+                    "downloaded_photo_count",
+                    downloaded.get("downloaded_photo_count", 0),
+                )
+            )
+            self.log_activity(
+                f"监装照片下载与文字识别完成：原图 {count} 张",
+                source="ocr",
+            )
+            self._finish_background_job(job, "done")
+        except Exception as exc:
+            LOGGER.exception(
+                "background OCR failed key=%s",
+                job["cpm_id"],
+            )
+            attempts = int(job.get("attempts", 0)) + 1
+            status = "pending" if attempts < 4 else "failed"
+            self.log_activity(f"后台照片文字识别失败：{exc}", "error", "ocr")
+            self._finish_background_job(job, status, str(exc))
+        finally:
+            with self._ocr_job_lock:
+                self._ocr_job_running = False
+
     def run_one_job(self) -> bool:
+        if self._drain_requested.is_set():
+            return False
+        with self._ocr_job_lock:
+            ocr_busy = self._ocr_job_running
         with self.database.transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM background_jobs WHERE status='pending' AND run_after<=? "
+                "AND (?=0 OR job_type='gate_pdf') "
                 "ORDER BY CASE WHEN job_type='gate_pdf' THEN 0 ELSE 1 END, "
                 "CASE WHEN cpm_id GLOB '[0-9]*' THEN CAST(cpm_id AS INTEGER) ELSE 0 END DESC, "
                 "id DESC LIMIT 1",
-                (now_text(),),
+                (now_text(), int(ocr_busy)),
             ).fetchone()
             if not row:
                 return False
@@ -1035,16 +1231,28 @@ class SmartGPMSService:
                 (now_text(), row["id"]),
             )
             job = dict(row)
+        is_photo_job = job["job_type"] != "gate_pdf"
+        if is_photo_job:
+            with self._ocr_job_lock:
+                self._ocr_job_running = True
         try:
+            completed_status = "done"
             if job["job_type"] == "gate_pdf":
                 gate = self.database.gate_pass_by_key(str(job["cpm_id"]))
                 if not gate:
                     raise RuntimeError("通门证记录已不存在")
+                if self._gate_has_departed(gate):
+                    completed_status = "cancelled"
+                    self.log_activity(
+                        f"{gate['container_no']}：已实际出厂，跳过通门证 PDF 自动下载",
+                        source="gate_pdf",
+                        container_no=str(gate["container_no"]),
+                    )
                 planned_date = self._normalized_gate_date(
                     str(gate.get("planned_departure_at", ""))
                 )
                 today = business_now().strftime("%Y-%m-%d")
-                if planned_date == today:
+                if completed_status != "cancelled" and planned_date == today:
                     self.log_activity(
                         f"{gate['container_no']}：后台生成通门证 PDF",
                         source="gate_pdf",
@@ -1058,8 +1266,9 @@ class SmartGPMSService:
                         source="gate_pdf",
                         container_no=str(gate["container_no"]),
                     )
+                self._finish_background_job(job, completed_status)
             else:
-                self.log_activity("后台正在处理监装照片与文字识别", source="ocr")
+                self.log_activity("后台正在下载监装照片", source="ocr")
                 detail = self._browser_call(
                     self.browser.fetch_cpm_detail, job["cpm_id"]
                 )
@@ -1067,13 +1276,26 @@ class SmartGPMSService:
                     "photos"
                 ):
                     raise RuntimeError("DAS 照片页面状态为 5，但详情暂未返回照片")
-                result = self._browser_call(self.photos.process, job["cpm_id"], detail)
+                downloaded = self._browser_call(
+                    self.photos.download,
+                    job["cpm_id"],
+                    detail,
+                )
                 self.log_activity(
-                    "监装照片下载与文字识别完成："
-                    f"原图 {int(result.get('downloaded_photo_count', 0))} 张",
+                    "监装原图下载完成，已转入独立 CPU 线程识别",
                     source="ocr",
                 )
-            status, error = "done", ""
+                future = self._ocr_executor.submit(
+                    self.photos.recognize,
+                    job["cpm_id"],
+                    detail,
+                )
+                future.add_done_callback(
+                    lambda completed, current=job, inventory=downloaded: (
+                        self._complete_photo_ocr(current, inventory, completed)
+                    )
+                )
+                return True
         except Exception as exc:
             LOGGER.exception(
                 "background job failed type=%s key=%s",
@@ -1088,17 +1310,10 @@ class SmartGPMSService:
                 )
             else:
                 self.log_activity(f"后台照片文字识别失败：{exc}", "error", "ocr")
-        with self.database.connect() as connection:
-            run_after = now_text()
-            if status == "pending":
-                delay = (60, 300, 900)[min(attempts - 1, 2)]
-                run_after = (
-                    business_now() + timedelta(seconds=delay)
-                ).isoformat(timespec="seconds")
-            connection.execute(
-                "UPDATE background_jobs SET status=?,last_error=?,run_after=?,updated_at=? WHERE id=?",
-                (status, error, run_after, now_text(), job["id"]),
-            )
+            self._finish_background_job(job, status, error)
+            if is_photo_job:
+                with self._ocr_job_lock:
+                    self._ocr_job_running = False
         return True
 
     def prepare_container(self, container_no: str) -> dict[str, Any] | None:
@@ -1123,7 +1338,18 @@ class SmartGPMSService:
             )
             detail = self._browser_call(self.browser.fetch_cpm_detail, record["cpm_id"])
             self._browser_call(
-                self.photos.process,
+                self.photos.download,
+                record["cpm_id"],
+                detail,
+                lambda stage, label: self.log_activity(
+                    f"{container_no}：{label}",
+                    source="verify",
+                    container_no=container_no,
+                    stage=stage,
+                ),
+            )
+            self._ocr_call(
+                self.photos.recognize,
                 record["cpm_id"],
                 detail,
                 lambda stage, label: self.log_activity(
@@ -1270,14 +1496,31 @@ class SmartGPMSService:
         return str(target)
 
     def _loop(self) -> None:
-        next_check = next_sync = 0.0
+        next_check = next_gate_sync = next_photo_sync = 0.0
         next_cleanup = self._next_cache_cleanup()
+
+        def check_gate_between_photo_batches() -> None:
+            nonlocal next_gate_sync
+            if time.monotonic() < next_gate_sync or self._drain_requested.is_set():
+                return
+            try:
+                self.sync_gate_passes(
+                    business_now(),
+                    _task_lock_owned=True,
+                )
+            finally:
+                next_gate_sync = (
+                    time.monotonic() + self.config.gate_sync_interval_seconds
+                )
+
         self.log_activity(
             f"缓存自动清理已计划于 {next_cleanup.strftime('%Y-%m-%d %H:%M')}",
             source="cleanup",
         )
         while not self._stop.wait(2):
             try:
+                if self._drain_requested.is_set():
+                    break
                 now = time.monotonic()
                 wall_now = business_now()
                 if wall_now >= next_cleanup:
@@ -1312,6 +1555,8 @@ class SmartGPMSService:
                 if now >= next_check:
                     self.check_session()
                     next_check = now + self.config.session_check_seconds
+                    if self.database.session().get("status") != "logged_in":
+                        continue
                 window_open = self._background_window_open()
                 if window_open != self._background_window_active:
                     self._background_window_active = window_open
@@ -1325,16 +1570,31 @@ class SmartGPMSService:
                     )
                 if not window_open:
                     continue
+                startup_sync = self._startup_sync_pending
+                self._startup_sync_pending = False
+                if startup_sync or now >= next_gate_sync:
+                    try:
+                        self.sync_gate_passes(wall_now)
+                    finally:
+                        next_gate_sync = (
+                            time.monotonic()
+                            + self.config.gate_sync_interval_seconds
+                        )
+                    if self._drain_requested.is_set():
+                        break
+                if startup_sync or now >= next_photo_sync:
+                    try:
+                        self.sync_latest_window(
+                            gate_checkpoint=check_gate_between_photo_batches
+                        )
+                    finally:
+                        next_photo_sync = (
+                            time.monotonic()
+                            + self.config.photo_sync_interval_seconds
+                        )
                 if (
-                    self.database.session().get("status") == "logged_in"
-                    and (self._startup_sync_pending or now >= next_sync)
-                ):
-                    self._startup_sync_pending = False
-                    self.sync_gate_passes(wall_now)
-                    self.sync_latest_window()
-                    next_sync = time.monotonic() + self.config.sync_interval_seconds
-                if (
-                    self.database.session().get("status") == "logged_in"
+                    not self._drain_requested.is_set()
+                    and self.database.session().get("status") == "logged_in"
                     and now >= self._background_resume_at
                 ):
                     self.run_one_job()

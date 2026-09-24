@@ -1,3 +1,9 @@
+import os
+import time
+
+import pytest
+from fastapi import HTTPException
+
 import app as app_module
 from smartgpms.database import Database
 from smartgpms.time_utils import business_now
@@ -102,7 +108,68 @@ def test_left_panel_allocates_remaining_height_to_departure_list():
     markup = (root / "static" / "index.html").read_text(encoding="utf-8")
     styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'styles.css?v=0.12.3' in markup
+    assert 'styles.css?v=0.14.0' in markup
     assert ".input-panel>textarea{height:200px" in styles
     assert ".departure-panel{display:flex;min-height:150px;flex:1 1 auto" in styles
     assert ".departure-list{min-height:70px;max-height:none;flex:1 1 auto" in styles
+
+
+def test_print_spool_copy_does_not_inherit_expired_cache_timestamp(tmp_path):
+    cached_pdf = tmp_path / "gatepass" / "cached.pdf"
+    staged_pdf = tmp_path / "print-spool" / "token.pdf"
+    cached_pdf.parent.mkdir()
+    cached_pdf.write_bytes(b"%PDF-1.4\n")
+    expired_time = time.time() - app_module.PENDING_PRINT_TTL_SECONDS - 60
+    os.utime(cached_pdf, (expired_time, expired_time))
+
+    app_module._stage_pending_pdf(cached_pdf, staged_pdf)
+
+    assert staged_pdf.read_bytes() == cached_pdf.read_bytes()
+    assert staged_pdf.stat().st_mtime > expired_time
+    assert staged_pdf.stat().st_mtime >= time.time() - 5
+
+
+def test_topbar_keeps_only_page_reload_and_polls_session_status():
+    root = app_module.BASE_DIR
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    script = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="check-session"' not in markup
+    assert 'id="reload-page"' in markup
+    assert 'title="刷新页面"' in markup
+    assert '$("#reload-page").addEventListener("click",()=>window.location.reload())' in script
+    assert 'api("/api/session/status")' in script
+    assert "setInterval(refreshSessionStatus,60000)" in script
+
+
+def test_session_status_endpoint_reads_cached_database_state(tmp_path, monkeypatch):
+    database = Database(tmp_path / "smartgpms.sqlite3")
+    database.update_session("logged_in", "operator.one", "会话有效")
+    monkeypatch.setattr(app_module, "database", database)
+
+    result = app_module.session_status()
+
+    assert result["status"] == "logged_in"
+    assert result["username"] == "operator.one"
+
+
+def test_result_legend_is_stacked_below_heading_compactly():
+    root = app_module.BASE_DIR
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert markup.index("<h2>门证/监装照片核对</h2>") < markup.index(
+        '<div class="legend">'
+    )
+    assert ".result-heading{align-items:flex-start" in styles
+    assert "flex-direction:column" in styles
+    assert ".result-heading .legend{gap:14px;font-size:11.5px" in styles
+
+
+def test_server_mode_cannot_be_stopped_by_a_client_page(monkeypatch):
+    monkeypatch.setattr(app_module, "RUN_MODE", "server")
+
+    with pytest.raises(HTTPException) as error:
+        app_module.desktop_shutdown()
+
+    assert error.value.status_code == 404

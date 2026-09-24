@@ -58,6 +58,25 @@ def test_linux_does_not_try_to_decrypt_a_windows_dpapi_file(tmp_path):
     assert store.load() == ("windows.user", "")
 
 
+def test_windows_service_identity_can_ignore_another_dpapi_identity(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "credentials.json"
+    path.write_text(
+        '{"username":"desktop.user","password_dpapi":"encrypted"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "smartgpms.credentials._windows_unprotect",
+        lambda _value: (_ for _ in ()).throw(OSError("different DPAPI identity")),
+    )
+
+    store = CredentialStore(path, platform_name="nt")
+
+    assert store.load() == ("desktop.user", "")
+    assert store.public()["has_password"] is False
+
+
 def test_linux_credential_store_serializes_concurrent_saves(tmp_path):
     store = CredentialStore(tmp_path / "credentials.json", platform_name="posix")
     expected = {f"user.{index}": f"password-{index}" for index in range(8)}

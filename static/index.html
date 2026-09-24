@@ -7,12 +7,12 @@
   <link rel="icon" href="/static/assets/smartgpms-app.ico?v=1" sizes="any">
   <link rel="icon" type="image/png" href="/static/assets/smartgpms-app.png?v=1">
   <link rel="apple-touch-icon" href="/static/assets/smartgpms-app.png?v=1">
-  <link rel="stylesheet" href="/static/styles.css?v=0.12.3">
+  <link rel="stylesheet" href="/static/styles.css?v=0.14.0">
 </head>
 <body>
   <header class="topbar">
     <div class="brand-title"><span class="brand-mark">GP</span><span class="brand-copy"><strong class="app-title">Smart GPMS</strong><small>集装箱智能通门</small></span></div>
-    <div class="session-line"><i id="session-dot"></i><span id="session-text">未登录</span><button id="check-session" class="refresh-button" title="刷新" aria-label="刷新会话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66"/><path d="M20 4v7h-7"/></svg></button></div>
+    <div class="session-line"><i id="session-dot"></i><span id="session-text">未登录</span><button id="reload-page" class="refresh-button page-refresh-button" title="刷新页面" aria-label="刷新页面"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6"/><path d="M5.5 15a8 8 0 1 0 1.2-8.9L4 10"/></svg></button></div>
   </header>
   <main id="workspace" class="workspace login-mode">
     <aside id="input-panel" class="input-panel hidden">
@@ -87,7 +87,7 @@
     </section>
   </div>
   <div id="toast" role="status"></div>
-  <script src="/static/app.js?v=0.12.2"></script>
+  <script src="/static/app.js?v=0.14.0"></script>
   <script src="/static/local-first.js?v=0.12.2"></script>
 </body>
 </html>

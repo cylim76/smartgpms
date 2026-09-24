@@ -19,6 +19,7 @@ APP_URL = os.environ.get(
 )
 DATA_DIR = Path(os.environ.get("SMARTGPMS_DATA_DIR") or ROOT / "data").resolve()
 UI_PROFILE_DIR = DATA_DIR / "ui-browser-profile"
+RUN_MODE = os.environ.get("SMARTGPMS_RUN_MODE", "server").strip().lower()
 
 
 def _browser_candidates() -> list[Path]:
@@ -119,9 +120,29 @@ def _launch_arguments(browser: Path) -> list[str]:
         f"--app={APP_URL}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-background-mode",
     ]
     arguments.extend(_centered_window_args(_screen_size()))
     return arguments
+
+
+def _should_monitor_window() -> bool:
+    return os.name == "nt" and RUN_MODE == "desktop"
+
+
+def _notify_desktop_closed() -> None:
+    request = urllib.request.Request(
+        f"{APP_URL.rstrip('/')}/api/desktop/shutdown",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5.0):
+            pass
+    except (OSError, TimeoutError, urllib.error.URLError):
+        # The server may already be stopping or may have been closed manually.
+        pass
 
 
 def main() -> None:
@@ -132,7 +153,10 @@ def main() -> None:
         webbrowser.open(APP_URL)
         return
     UI_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen(_launch_arguments(browser), close_fds=True)
+    process = subprocess.Popen(_launch_arguments(browser), close_fds=True)
+    if _should_monitor_window():
+        process.wait()
+        _notify_desktop_closed()
 
 
 if __name__ == "__main__":

@@ -97,7 +97,7 @@ class DasBrowser:
                 from playwright.sync_api import sync_playwright
             except ImportError as exc:
                 raise DasBrowserError(
-                    "尚未安装 Playwright，请先运行 setup.bat 或 ./setup.sh"
+                    "尚未安装 Playwright，请先运行 setup_win.bat 或 ./setup_linux.sh"
                 ) from exc
             self.config.browser_profile_dir.mkdir(parents=True, exist_ok=True)
             try:

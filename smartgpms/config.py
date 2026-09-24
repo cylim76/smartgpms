@@ -18,7 +18,9 @@ class AppConfig:
         "http://das.china.lge.com:7005/Manage/cpm/R_CPM_SEARCH.aspx?t3_menuid=EGT340112"
     )
     session_check_seconds: int = 600
-    sync_interval_seconds: int = 600
+    gate_sync_interval_seconds: int = 600
+    photo_sync_interval_seconds: int = 1200
+    photo_scan_batch_size: int = 20
     sync_batch_size: int = 100
     targeted_scan_limit: int = 300
     startup_snapshot_size: int = 500

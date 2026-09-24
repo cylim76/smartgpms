@@ -6,6 +6,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from io import BytesIO
 from pathlib import Path
@@ -22,12 +23,13 @@ from smartgpms.credentials import CredentialStore
 from smartgpms.das_browser import DasBrowserError, GatePassNotFound, LoginRequired
 from smartgpms.database import Database
 from smartgpms.iso6346 import normalize, validate_container_number
-from smartgpms.service import SmartGPMSService
+from smartgpms.service import ServiceStopping, SmartGPMSService
 from smartgpms.time_utils import business_now
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DATA_DIR = Path(os.environ.get("SMARTGPMS_DATA_DIR", BASE_DIR / "data")).resolve()
+RUN_MODE = os.environ.get("SMARTGPMS_RUN_MODE", "server").strip().lower()
 config = AppConfig(BASE_DIR, data_root=DATA_DIR)
 database = Database(DATA_DIR / "smartgpms.sqlite3")
 database.activate_ocr_pipeline(
@@ -38,6 +40,21 @@ service = SmartGPMSService(config, database, credentials)
 pending_prints: dict[str, dict[str, Any]] = {}
 pending_prints_lock = threading.Lock()
 PENDING_PRINT_TTL_SECONDS = 600
+desktop_shutdown_callback: Callable[[], None] | None = None
+desktop_shutdown_started = threading.Event()
+
+
+def configure_desktop_shutdown(callback: Callable[[], None]) -> None:
+    """Register the desktop runner's request for Uvicorn to exit."""
+    global desktop_shutdown_callback
+    desktop_shutdown_callback = callback
+
+
+def _run_foreground(function, *args, **kwargs):
+    try:
+        return service.run_foreground(function, *args, **kwargs)
+    except ServiceStopping as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @asynccontextmanager
@@ -47,7 +64,7 @@ async def lifespan(_: FastAPI):
     service.stop()
 
 
-app = FastAPI(title="smartGPMS", version="0.12.3", lifespan=lifespan)
+app = FastAPI(title="smartGPMS", version="0.14.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -261,6 +278,12 @@ def _delete_pending_pdf(pending: dict[str, Any]) -> None:
             pass
 
 
+def _stage_pending_pdf(source: Path, target: Path) -> None:
+    """Create a fresh print-spool copy without inheriting cache timestamps."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+
+
 def _get_pending_print(token: str) -> dict[str, Any]:
     _cleanup_pending_prints()
     with pending_prints_lock:
@@ -281,7 +304,9 @@ def bootstrap():
         "version": app.version,
         "session": database.session(),
         "credentials": credentials.public(),
-        "sync_interval_seconds": config.sync_interval_seconds,
+        "sync_interval_seconds": config.photo_sync_interval_seconds,
+        "gate_sync_interval_seconds": config.gate_sync_interval_seconds,
+        "photo_sync_interval_seconds": config.photo_sync_interval_seconds,
         "ocr_engine": "RapidOCR / ONNX Runtime CPU",
         "database": database.stats(),
     }
@@ -289,6 +314,10 @@ def bootstrap():
 
 @app.post("/api/login")
 def login(payload: LoginPayload):
+    return _run_foreground(_login, payload)
+
+
+def _login(payload: LoginPayload):
     username = payload.username.strip()
     password = payload.password
     if not password:
@@ -310,11 +339,17 @@ def check_session():
     return service.check_session()
 
 
+@app.get("/api/session/status")
+def session_status():
+    """Return the last background-verified state without opening DAS."""
+    return database.session()
+
+
 @app.post("/api/sync")
 def sync_now():
     if database.session().get("status") != "logged_in":
         raise HTTPException(status_code=401, detail="请先登录 SSO")
-    return service.sync_latest_window()
+    return _run_foreground(service.sync_latest_window)
 
 
 @app.get("/api/activity")
@@ -346,6 +381,10 @@ def acknowledge_gate_departure(payload: GateNoticeAckPayload):
 
 @app.post("/api/verify")
 def verify(payload: VerifyPayload):
+    return _run_foreground(_verify, payload)
+
+
+def _verify(payload: VerifyPayload):
     numbers = _clean_numbers(payload.containers)
     if not numbers:
         raise HTTPException(status_code=400, detail="请输入至少一个箱号")
@@ -355,6 +394,8 @@ def verify(payload: VerifyPayload):
     service.log_activity(f"开始核验 {len(numbers)} 个箱号", source="verify")
     rows: list[dict[str, Any]] = []
     for number in numbers:
+        if rows and service.is_draining:
+            break
         service.log_activity(
             f"{number}：开始查询",
             source="verify",
@@ -625,6 +666,10 @@ def photo_thumbnail(cpm_id: str, photo_id: int):
 
 @app.post("/api/print")
 def print_gate(payload: PrintPayload):
+    return _run_foreground(_print_gate, payload)
+
+
+def _print_gate(payload: PrintPayload):
     _cleanup_pending_prints()
     record = database.cpm_by_id(payload.cpm_id)
     if not record:
@@ -660,8 +705,7 @@ def print_gate(payload: PrintPayload):
         token = uuid.uuid4().hex
         pdf_path = config.print_spool_dir / f"{token}.pdf"
         gate, cached_pdf, result = service.ensure_gatepass_pdf(gate)
-        pdf_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(cached_pdf, pdf_path)
+        _stage_pending_pdf(cached_pdf, pdf_path)
         snapshot = {
             "gate_container_no": gate.get("container_no", ""),
             "gate_seal_no": gate.get("seal_no", ""),
@@ -789,3 +833,27 @@ def health():
         "version": app.version,
         "session": database.session().get("status", "logged_out"),
     }
+
+
+@app.post("/api/desktop/shutdown")
+def desktop_shutdown():
+    """Gracefully stop only the dedicated local Windows desktop instance."""
+    if RUN_MODE != "desktop":
+        raise HTTPException(status_code=404, detail="Not found")
+    if desktop_shutdown_started.is_set():
+        return {"ok": True, "draining": True}
+    desktop_shutdown_started.set()
+
+    def finish_shutdown() -> None:
+        try:
+            service.drain_and_stop()
+        finally:
+            if desktop_shutdown_callback is not None:
+                desktop_shutdown_callback()
+
+    threading.Thread(
+        target=finish_shutdown,
+        name="smartgpms-desktop-shutdown",
+        daemon=True,
+    ).start()
+    return {"ok": True, "draining": True}
