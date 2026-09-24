@@ -4,8 +4,9 @@ from smartgpms.config import AppConfig
 from smartgpms.credentials import CredentialStore
 from smartgpms.database import Database
 from smartgpms.service import SmartGPMSService
+from smartgpms.time_utils import business_now
 
-TODAY = datetime.now().astimezone().strftime("%Y-%m-%d 08:00:00")
+TODAY = business_now().strftime("%Y-%m-%d 08:00:00")
 
 
 def save_ready_stage4_photos(database, tmp_path, cpm_id, count=3):

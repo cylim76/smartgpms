@@ -7,7 +7,6 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -24,6 +23,7 @@ from smartgpms.das_browser import DasBrowserError, GatePassNotFound, LoginRequir
 from smartgpms.database import Database
 from smartgpms.iso6346 import normalize, validate_container_number
 from smartgpms.service import SmartGPMSService
+from smartgpms.time_utils import business_now
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -45,7 +45,7 @@ async def lifespan(_: FastAPI):
     service.stop()
 
 
-app = FastAPI(title="smartGPMS", version="0.11.0", lifespan=lifespan)
+app = FastAPI(title="smartGPMS", version="0.11.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -154,7 +154,7 @@ def _gate_date_valid(gate: dict[str, Any] | None) -> bool:
     planned = service._normalized_gate_date(
         str(gate.get("planned_departure_at", ""))
     )
-    return planned == datetime.now().astimezone().strftime("%Y-%m-%d")
+    return planned == business_now().strftime("%Y-%m-%d")
 
 
 def _comparison_fields(

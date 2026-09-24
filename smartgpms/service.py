@@ -18,6 +18,7 @@ from .credentials import CredentialStore
 from .das_browser import DasBrowser, LoginRequired
 from .database import Database, now_text
 from .photo_pipeline import PhotoPipeline
+from .time_utils import business_now
 
 LOGGER = logging.getLogger(__name__)
 ACTIVITY_RETENTION_SECONDS = 2 * 60 * 60
@@ -62,7 +63,7 @@ class SmartGPMSService:
             self._activity_seq += 1
             entry = {
                 "id": self._activity_seq,
-                "at": datetime.now().astimezone().strftime("%H:%M:%S"),
+                "at": business_now().strftime("%H:%M:%S"),
                 "logged_at": logged_at,
                 "level": level,
                 "source": source,
@@ -174,7 +175,7 @@ class SmartGPMSService:
             initializing = not initialized
             mode = "首次初始化" if initializing else "日常同步"
             local_max = self.database.max_numeric_cpm_id()
-            cutoff = (datetime.now().astimezone() - timedelta(days=30)).date()
+            cutoff = (business_now() - timedelta(days=30)).date()
             self.log_activity(
                 f"{mode}：正在读取 DAS 最新监装记录",
                 source="sync",
@@ -389,7 +390,7 @@ class SmartGPMSService:
         ):
             try:
                 return datetime.strptime(text, fmt).replace(
-                    tzinfo=datetime.now().astimezone().tzinfo
+                    tzinfo=business_now().tzinfo
                 )
             except ValueError:
                 continue
@@ -452,7 +453,7 @@ class SmartGPMSService:
         """Synchronize gate passes planned for today and queue new/changed PDFs."""
         if not self._task_lock.acquire(blocking=False):
             return {"scanned": 0, "new": 0, "updated": 0, "queued": 0, "busy": True}
-        current = current or datetime.now().astimezone()
+        current = current or business_now()
         date_value = current.strftime("%Y%m%d")
         today = current.strftime("%Y-%m-%d")
         scanned = new = updated = queued = 0
@@ -521,7 +522,7 @@ class SmartGPMSService:
         planned_date = self._normalized_gate_date(
             str(saved.get("planned_departure_at", ""))
         )
-        today = datetime.now().astimezone().strftime("%Y-%m-%d")
+        today = business_now().strftime("%Y-%m-%d")
         pdf_path = Path(str(saved.get("pdf_path", "")))
         expected_pdf_path = self.gatepass_pdf_path(saved)
         changed = bool(
@@ -545,7 +546,7 @@ class SmartGPMSService:
         if planned is None:
             planned = self._parsed_gate_datetime(
                 str(gate.get("application_date", ""))
-            ) or datetime.now().astimezone()
+            ) or business_now()
         year = planned.strftime("%Y")
         month = planned.strftime("%m")
         prefix = planned.strftime("%Y%m%d%H%M%S")
@@ -599,7 +600,7 @@ class SmartGPMSService:
                 LOGGER.warning("Unable to remove replaced gate-pass PDF: %s", resolved)
 
     def cleanup_gatepass_pdfs(self, current: datetime | None = None) -> dict[str, int]:
-        current = current or datetime.now().astimezone()
+        current = current or business_now()
         cutoff = (current - timedelta(days=self.config.gatepass_pdf_retention_days)).date()
         root = self.config.gatepass_dir.resolve()
         removed = released = 0
@@ -687,7 +688,7 @@ class SmartGPMSService:
             max_checks = (
                 limit * 3 if initializing else self.config.daily_scan_safety_limit
             )
-            cutoff = (datetime.now().astimezone() - timedelta(days=30)).date()
+            cutoff = (business_now() - timedelta(days=30)).date()
             while checked < max_checks:
                 if initializing and found >= limit:
                     break
@@ -838,7 +839,7 @@ class SmartGPMSService:
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
             try:
                 return datetime.strptime(text[:19], fmt).replace(
-                    tzinfo=datetime.now().astimezone().tzinfo
+                    tzinfo=business_now().tzinfo
                 ).date()
             except ValueError:
                 continue
@@ -846,11 +847,11 @@ class SmartGPMSService:
 
     @staticmethod
     def _background_window_open(current: datetime | None = None) -> bool:
-        current = current or datetime.now().astimezone()
+        current = current or business_now()
         return 7 <= current.hour <= 23
 
     def _next_cache_cleanup(self, current: datetime | None = None) -> datetime:
-        current = current or datetime.now().astimezone()
+        current = current or business_now()
         scheduled = current.replace(
             hour=self.config.cache_cleanup_hour,
             minute=self.config.cache_cleanup_minute,
@@ -966,7 +967,7 @@ class SmartGPMSService:
     @staticmethod
     def _is_recent(record: dict[str, Any]) -> bool:
         text = str(record.get("end_date") or record.get("begin_date") or "")
-        current = datetime.now().astimezone()
+        current = business_now()
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
             try:
                 parsed = datetime.strptime(text[:19], fmt).replace(
@@ -1001,7 +1002,7 @@ class SmartGPMSService:
                 planned_date = self._normalized_gate_date(
                     str(gate.get("planned_departure_at", ""))
                 )
-                today = datetime.now().astimezone().strftime("%Y-%m-%d")
+                today = business_now().strftime("%Y-%m-%d")
                 if planned_date == today:
                     self.log_activity(
                         f"{gate['container_no']}：后台生成通门证 PDF",
@@ -1051,7 +1052,7 @@ class SmartGPMSService:
             if status == "pending":
                 delay = (60, 300, 900)[min(attempts - 1, 2)]
                 run_after = (
-                    datetime.now().astimezone() + timedelta(seconds=delay)
+                    business_now() + timedelta(seconds=delay)
                 ).isoformat(timespec="seconds")
             connection.execute(
                 "UPDATE background_jobs SET status=?,last_error=?,run_after=?,updated_at=? WHERE id=?",
@@ -1207,7 +1208,7 @@ class SmartGPMSService:
         }
 
     def freeze_print_evidence(self, cpm_id: str, snapshot: dict[str, Any]) -> str:
-        stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        stamp = business_now().strftime("%Y%m%d_%H%M%S_%f")
         target = self.config.evidence_dir / cpm_id / stamp
         target.mkdir(parents=True, exist_ok=False)
         for name, ocr in (
@@ -1237,7 +1238,7 @@ class SmartGPMSService:
         while not self._stop.wait(2):
             try:
                 now = time.monotonic()
-                wall_now = datetime.now().astimezone()
+                wall_now = business_now()
                 if wall_now >= next_cleanup:
                     next_cleanup = self._next_cache_cleanup(
                         wall_now + timedelta(minutes=1)

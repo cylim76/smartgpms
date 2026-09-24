@@ -4,14 +4,15 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from .time_utils import business_now
+
 
 def now_text() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return business_now().isoformat(timespec="seconds")
 
 
 class Database:

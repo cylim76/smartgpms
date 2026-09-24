@@ -1,4 +1,6 @@
 import os
+import stat
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -40,6 +42,9 @@ def test_linux_credential_store_uses_local_fernet_key(tmp_path):
     }
     assert "linux-password" not in store.path.read_text(encoding="utf-8")
     assert store.key_path.is_file()
+    if os.name != "nt":
+        assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(store.key_path.stat().st_mode) == 0o600
 
 
 def test_linux_does_not_try_to_decrypt_a_windows_dpapi_file(tmp_path):
@@ -51,3 +56,14 @@ def test_linux_does_not_try_to_decrypt_a_windows_dpapi_file(tmp_path):
     store = CredentialStore(path, platform_name="posix")
 
     assert store.load() == ("windows.user", "")
+
+
+def test_linux_credential_store_serializes_concurrent_saves(tmp_path):
+    store = CredentialStore(tmp_path / "credentials.json", platform_name="posix")
+    expected = {f"user.{index}": f"password-{index}" for index in range(8)}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(lambda item: store.save(*item), expected.items()))
+
+    username, password = store.load()
+    assert password == expected[username]

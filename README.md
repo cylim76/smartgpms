@@ -11,6 +11,7 @@
 - Linux 使用权限为 `0600` 的本机 Fernet 密钥加密凭据；
 - OTP 永不保存；
 - 后台浏览器在 Windows 优先使用 Edge，在 Linux 使用 Playwright Chromium；
+- 业务日期和后台任务时间统一使用中国标准时间（UTC+8），不受 Linux 主机时区影响；
 - 服务端生成门证 PDF，最终打印由访问页面的客户端电脑完成。
 
 完整方案见 [docs/development_plan.md](docs/development_plan.md)。

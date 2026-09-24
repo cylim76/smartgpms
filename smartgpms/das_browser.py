@@ -6,7 +6,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,7 @@ from .das_parser import (
     parse_gate_detail,
     parse_gate_search_rows,
 )
+from .time_utils import business_now
 
 LOGGER = logging.getLogger(__name__)
 
@@ -374,7 +375,7 @@ class DasBrowser:
             if start_date.count():
                 start_date.first.fill("20000101")
             if end_date.count():
-                end_date.first.fill(datetime.now().astimezone().strftime("%Y%m%d"))
+                end_date.first.fill(business_now().strftime("%Y%m%d"))
             response_source = ""
             try:
                 with page.expect_response(
@@ -447,9 +448,7 @@ class DasBrowser:
         with self._lock:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-            date_value = application_date or datetime.now().astimezone().strftime(
-                "%Y%m%d"
-            )
+            date_value = application_date or business_now().strftime("%Y%m%d")
             page = self.refresh_das()
             for selector in ("#txt_BeginDate", "#txt_EndDate"):
                 field = page.locator(selector)
@@ -509,7 +508,7 @@ class DasBrowser:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
             page = self.refresh_das()
-            current = datetime.now().astimezone()
+            current = business_now()
             start_date = (current - timedelta(days=60)).strftime("%Y%m%d")
             end_date = current.strftime("%Y%m%d")
             self._query_container(page, container_no, start_date, end_date)
@@ -634,7 +633,7 @@ class DasBrowser:
                 "尚未识别门证页面的箱号查询框，需要登录后采集一次 DOM"
             )
         field.fill(container_no)
-        current = datetime.now().astimezone()
+        current = business_now()
         dates = {
             "#txt_BeginDate": start_date
             or (current - timedelta(days=60)).strftime("%Y%m%d"),

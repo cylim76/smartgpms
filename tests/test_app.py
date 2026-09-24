@@ -1,7 +1,6 @@
-from datetime import datetime
-
 import app as app_module
 from smartgpms.database import Database
+from smartgpms.time_utils import business_now
 
 
 def test_local_verification_returns_without_opening_das(tmp_path, monkeypatch):
@@ -34,7 +33,7 @@ def test_local_verification_returns_without_opening_das(tmp_path, monkeypatch):
 
 
 def test_gate_date_validation_uses_planned_departure_calendar_date():
-    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    today = business_now().strftime("%Y-%m-%d")
 
     assert app_module._gate_date_valid(
         {"planned_departure_at": f"{today} 08:30:00"}

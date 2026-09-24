@@ -19,6 +19,7 @@ from .ai_postprocess import (
 from .das_browser import DasBrowser
 from .database import Database, now_text
 from .recognition import RapidOCREngine, save_crop
+from .time_utils import business_now
 
 
 class PhotoPipeline:
@@ -354,13 +355,13 @@ class PhotoPipeline:
             return None
         try:
             parsed = datetime.fromisoformat(text[:25])
-            return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=business_now().tzinfo)
         except ValueError:
             pass
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
             try:
                 return datetime.strptime(text[:19], fmt).replace(
-                    tzinfo=datetime.now().astimezone().tzinfo
+                    tzinfo=business_now().tzinfo
                 )
             except ValueError:
                 continue
@@ -403,7 +404,7 @@ class PhotoPipeline:
         current: datetime | None = None,
     ) -> dict[str, int]:
         """Clean reproducible cache while preserving print evidence and metadata."""
-        current = current or datetime.now().astimezone()
+        current = current or business_now()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         entries = self.database.cache_cleanup_entries()
         active = set(entries["active_cpm_ids"])

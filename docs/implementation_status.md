@@ -2,13 +2,15 @@
 
 更新时间：2026-09-24
 
-## 2026-09-24 Windows/Linux 双系统运行（0.11.0）
+## 2026-09-24 Windows/Linux 双系统运行（0.11.1）
 
 - 保留 Windows 的 `setup.bat`、`run.bat` 和 DPAPI 使用体验；
 - 新增 Linux 的 `setup.sh`、`run.sh`、`run_server.sh` 及 systemd 服务模板；
 - 安装程序自动创建虚拟环境，并按平台选择 Edge 或 Playwright Chromium；
 - Linux 凭据使用本机 Fernet 密钥加密，凭据文件和密钥权限限制为 `0600`，OTP 不保存；
 - `SMARTGPMS_DATA_DIR` 支持把业务数据与程序代码分离；
+- 业务日期、同步时段、日志和定时清理统一使用中国标准时间（UTC+8），避免 Linux 主机采用 UTC 时发生日期偏移；
+- 凭据读写增加线程锁，避免首次 Linux 登录重复提交时竞争创建密钥；
 - 当前仍保持单 SSO 会话和单后台浏览器，多用户会话隔离留待后续版本；
 
 ## 2026-09-24 通门证后台同步与本地 PDF 缓存（0.10.0）

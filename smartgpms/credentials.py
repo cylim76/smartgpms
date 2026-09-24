@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -83,6 +84,7 @@ class CredentialStore:
         self.path = path
         self.platform_name = platform_name or os.name
         self.key_path = path.with_name("credential.key")
+        self._lock = threading.RLock()
 
     @property
     def backend(self) -> str:
@@ -106,44 +108,52 @@ class CredentialStore:
         return Fernet(key)
 
     def save(self, username: str, password: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.platform_name == "nt":
-            payload = {
-                "username": username.strip(),
-                "scheme": "windows-dpapi",
-                "password_dpapi": _windows_protect(password),
-            }
-        else:
-            encrypted = self._fernet().encrypt(password.encode("utf-8")).decode("ascii")
-            payload = {
-                "username": username.strip(),
-                "scheme": "fernet-v1",
-                "password_fernet": encrypted,
-            }
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        if self.platform_name != "nt":
-            temporary.chmod(0o600)
-        temporary.replace(self.path)
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.platform_name == "nt":
+                payload = {
+                    "username": username.strip(),
+                    "scheme": "windows-dpapi",
+                    "password_dpapi": _windows_protect(password),
+                }
+            else:
+                encrypted = self._fernet().encrypt(password.encode("utf-8")).decode(
+                    "ascii"
+                )
+                payload = {
+                    "username": username.strip(),
+                    "scheme": "fernet-v1",
+                    "password_fernet": encrypted,
+                }
+            temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+            )
+            if self.platform_name != "nt":
+                temporary.chmod(0o600)
+            temporary.replace(self.path)
 
     def load(self) -> tuple[str, str]:
-        if not self.path.exists():
-            return "", ""
-        payload = json.loads(self.path.read_text(encoding="utf-8"))
-        username = str(payload.get("username", ""))
-        dpapi_value = str(payload.get("password_dpapi", ""))
-        fernet_value = str(payload.get("password_fernet", ""))
-        if dpapi_value:
+        with self._lock:
+            if not self.path.exists():
+                return "", ""
             if self.platform_name != "nt":
-                return username, ""
-            return username, _windows_unprotect(dpapi_value)
-        if fernet_value:
-            try:
-                password = self._fernet().decrypt(fernet_value.encode("ascii"))
-            except (InvalidToken, ValueError) as exc:
-                raise RuntimeError("无法解密已保存的 smartGPMS 凭据") from exc
-            return username, password.decode("utf-8")
-        return username, ""
+                self.path.chmod(0o600)
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            username = str(payload.get("username", ""))
+            dpapi_value = str(payload.get("password_dpapi", ""))
+            fernet_value = str(payload.get("password_fernet", ""))
+            if dpapi_value:
+                if self.platform_name != "nt":
+                    return username, ""
+                return username, _windows_unprotect(dpapi_value)
+            if fernet_value:
+                try:
+                    password = self._fernet().decrypt(fernet_value.encode("ascii"))
+                except (InvalidToken, ValueError) as exc:
+                    raise RuntimeError("无法解密已保存的 smartGPMS 凭据") from exc
+                return username, password.decode("utf-8")
+            return username, ""
 
     def public(self) -> dict[str, object]:
         username, password = self.load()
@@ -154,5 +164,6 @@ class CredentialStore:
         }
 
     def clear(self) -> None:
-        if self.path.exists():
-            self.path.unlink()
+        with self._lock:
+            if self.path.exists():
+                self.path.unlink()
