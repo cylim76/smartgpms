@@ -7,6 +7,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class AppConfig:
     base_dir: Path
+    data_root: Path | None = None
     sso_url: str = "http://newep.lge.com/portal/main/portalMain.do"
     das_login_url: str = "http://das.china.lge.com:7005/LoginSSO.aspx"
     gate_url: str = "http://das.china.lge.com:7005/eGate/tm/R_EGT_TMGERPVIEW.aspx?t3_menuid=EGT340103"
@@ -33,7 +34,7 @@ class AppConfig:
 
     @property
     def data_dir(self) -> Path:
-        return self.base_dir / "data"
+        return self.data_root or self.base_dir / "data"
 
     @property
     def browser_profile_dir(self) -> Path:

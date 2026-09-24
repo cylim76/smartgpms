@@ -91,7 +91,7 @@ def test_original_filename_decodes_encoded_das_path():
 
 
 def test_original_filename_is_not_silently_modified():
-    with pytest.raises(ValueError, match="原样保存"):
+    with pytest.raises(ValueError, match="跨平台安全保存"):
         PhotoPipeline._original_filename("http://das.example/photo/bad%3Fname.jpg")
 
 

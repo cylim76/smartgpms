@@ -1,9 +1,11 @@
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import playwright.sync_api
 import pytest
 
+import smartgpms.das_browser as das_browser_module
 from smartgpms.config import AppConfig
 from smartgpms.das_browser import DasBrowser, GatePassNotFound
 
@@ -49,8 +51,10 @@ class FakeContext:
 class FakeChromium:
     def __init__(self, context):
         self.context = context
+        self.calls = []
 
     def launch_persistent_context(self, *_args, **_kwargs):
+        self.calls.append((_args, _kwargs))
         return self.context
 
 
@@ -94,6 +98,28 @@ def test_ensure_rebuilds_a_stale_browser_context(tmp_path, monkeypatch):
     assert stale_context.closed
     assert stale_playwright.stopped
     assert new_page.timeout == 20_000
+
+
+def test_linux_browser_uses_playwright_chromium_without_edge_channel(
+    tmp_path, monkeypatch
+):
+    browser = DasBrowser(AppConfig(tmp_path))
+    page = FakePage()
+    context = FakeContext([page])
+    fake_playwright = FakePlaywright(context)
+    monkeypatch.setattr(
+        playwright.sync_api,
+        "sync_playwright",
+        lambda: FakeStarter(fake_playwright),
+    )
+    monkeypatch.setattr(das_browser_module, "os", SimpleNamespace(name="posix"))
+
+    assert browser._ensure() is context
+    options = fake_playwright.chromium.calls[0][1]
+    assert "channel" not in options
+    assert options["headless"] is True
+    assert options["locale"] == "zh-CN"
+    assert options["timezone_id"] == "Asia/Shanghai"
 
 
 def test_session_check_discards_browser_after_target_closed(tmp_path):

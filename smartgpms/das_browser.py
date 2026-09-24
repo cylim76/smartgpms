@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import threading
 import time
@@ -94,30 +95,45 @@ class DasBrowser:
                 from playwright.sync_api import Error as PlaywrightError
                 from playwright.sync_api import sync_playwright
             except ImportError as exc:
-                raise DasBrowserError("尚未安装 Playwright，请先运行 setup.bat") from exc
+                raise DasBrowserError(
+                    "尚未安装 Playwright，请先运行 setup.bat 或 ./setup.sh"
+                ) from exc
             self.config.browser_profile_dir.mkdir(parents=True, exist_ok=True)
             try:
                 self._playwright = sync_playwright().start()
-                self._context = self._playwright.chromium.launch_persistent_context(
-                    str(self.config.browser_profile_dir),
-                    channel="msedge",
-                    headless=headless,
-                    accept_downloads=True,
-                    viewport={"width": 1440, "height": 960},
-                )
-            except PlaywrightError as edge_error:
-                try:
+                options = {
+                    "headless": headless,
+                    "accept_downloads": True,
+                    "viewport": {"width": 1440, "height": 960},
+                    "locale": "zh-CN",
+                    "timezone_id": "Asia/Shanghai",
+                }
+                if os.name == "nt":
+                    try:
+                        self._context = (
+                            self._playwright.chromium.launch_persistent_context(
+                                str(self.config.browser_profile_dir),
+                                channel="msedge",
+                                **options,
+                            )
+                        )
+                    except PlaywrightError:
+                        self._context = (
+                            self._playwright.chromium.launch_persistent_context(
+                                str(self.config.browser_profile_dir),
+                                **options,
+                            )
+                        )
+                else:
                     self._context = self._playwright.chromium.launch_persistent_context(
                         str(self.config.browser_profile_dir),
-                        headless=headless,
-                        accept_downloads=True,
-                        viewport={"width": 1440, "height": 960},
+                        **options,
                     )
-                except PlaywrightError as fallback_error:
-                    self._discard()
-                    raise DasBrowserError(
-                        f"无法启动 smartGPMS 独立浏览器：{edge_error}; {fallback_error}"
-                    ) from fallback_error
+            except PlaywrightError as browser_error:
+                self._discard()
+                raise DasBrowserError(
+                    f"无法启动 smartGPMS 独立浏览器：{browser_error}"
+                ) from browser_error
             self._page = next(
                 (page for page in self._context.pages if not page.is_closed()), None
             ) or self._context.new_page()

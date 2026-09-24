@@ -1,31 +1,64 @@
 # smartGPMS
 
-Windows 本机运行的 DAS 门证箱号/铅封号核验与打印工具。
+可在 Windows 或 Linux 运行的 DAS 门证、监装照片、箱号和铅封号核验工具。
 
 ## 当前能力
 
-- 左侧一次输入多个箱号，右侧同时显示约 6 行核验结果；
-- 独立后台 Edge 会话完成 SSO（用户名、密码、OTP）及 DAS 登录；
-- 用户名和密码使用当前 Windows 用户的 DPAPI 加密保存，OTP 不保存；
-- SQLite 保存 CPMID/箱号/业务阶段、OCR 缓存、打印状态及不可变打印历史；
-- DAS 照片页面的流程状态转为 `5.铅封确认` 时，排队下载 U1/U2/U3/S1 四阶段照片并预裁剪；
-- RapidOCR + ONNX Runtime CPU 本地识别，自动尝试 0/90/180/270 度；
-- 绿色/红色/橙色区分一致、不一致和待人工确认；
-- 调用 DAS 原打印按钮成功后，将 `print_status` 从 0 改为 1，并记录最后打印时间；
-- 多 CPMID 时选取最新有效记录，列表回发目标从实际 `__doPostBack` 动态读取。
+- 一次核验多个集装箱，后台同步 DAS 门证、监装照片和 PDF；
+- RapidOCR + ONNX Runtime CPU 本地识别，无需大型 AI 镜像；
+- SQLite 保存业务数据、OCR 缓存、PDF 路径和打印历史；
+- Windows 使用当前用户的 DPAPI 加密凭据；
+- Linux 使用权限为 `0600` 的本机 Fernet 密钥加密凭据；
+- OTP 永不保存；
+- 后台浏览器在 Windows 优先使用 Edge，在 Linux 使用 Playwright Chromium；
+- 服务端生成门证 PDF，最终打印由访问页面的客户端电脑完成。
 
 完整方案见 [docs/development_plan.md](docs/development_plan.md)。
 
-## 启动
+## Windows 本机版
 
-1. 首次运行 `setup.bat`。
-2. 运行 `run.bat`。
-3. 系统会以独立应用窗口打开 `http://127.0.0.1:8765`，不显示普通浏览器的标签栏和地址栏。
+1. 首次双击 `setup.bat`。
+2. 以后双击 `run.bat`。
+3. 系统以独立应用窗口打开，不显示普通浏览器标签栏和地址栏。
 
-若电脑上找不到 Edge 或 Chrome，启动程序会退回到系统默认浏览器。
+Windows 的操作方式与原版本保持一致。检测到 Microsoft Edge 时直接复用 Edge；没有 Edge 时安装 Playwright Chromium。
 
-系统优先使用电脑已安装的 Microsoft Edge，不会安装几十 GB 的 AI 镜像。首次 OCR 会在本机加载 ONNX 小模型。
+## Linux 本机版
 
-## 尚需现场确认
+推荐使用 Python 3.10 以上的 Debian/Ubuntu x86_64 环境：
 
-DAS 是内部 ASP.NET 系统，查询框、详情弹窗和打印按钮的最终控件 ID 必须在真实登录页面做一次采集和实机打印验证。代码已有动态发现与安全失败机制：无法确认控件时不会误点其它按钮。
+```bash
+chmod +x setup.sh run.sh run_server.sh
+./setup.sh
+./run.sh
+```
+
+`setup.sh` 自动创建 `.venv`、安装 Python 依赖、Chromium 和 Linux 浏览器系统依赖。有图形桌面时，`run.sh` 会尝试打开应用窗口；无桌面时只运行服务。
+
+## Linux/Windows 无界面服务端
+
+Linux：
+
+```bash
+SMARTGPMS_DATA_DIR=/var/lib/smartgpms ./run_server.sh
+```
+
+Windows：运行 `run_server.bat`。
+
+服务端入口默认监听 `0.0.0.0:8765`，并且固定使用一个 Uvicorn worker。当前版本仍是单 SSO 会话架构，只能部署在受信任内网；正式开放给多个客户端前，应配置防火墙白名单、HTTPS/反向代理和应用访问认证。
+
+仓库提供了 [deploy/smartgpms.service](deploy/smartgpms.service) 作为 systemd 模板。生产环境建议：
+
+- 程序安装在 `/opt/smartgpms`；
+- 数据保存在 `/var/lib/smartgpms`；
+- 由 Nginx 或其他反向代理提供 HTTPS；
+- 服务端必须能访问公司 SSO、DAS、DNS及相关内部网络。
+
+## 环境变量
+
+- `SMARTGPMS_DATA_DIR`：SQLite、照片、门证 PDF、凭据和浏览器配置目录；默认是项目下的 `data`。
+- `SMARTGPMS_HOST`：监听地址。
+- `SMARTGPMS_PORT`：监听端口，默认 `8765`。
+- `SMARTGPMS_UI_URL`：本机应用窗口打开的地址。
+
+Windows DPAPI 文件不能直接在 Linux 解密。迁移数据目录后会保留用户名，但需要重新输入密码和 OTP，并由 Linux 重新加密保存。

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>smartGPMS 门证核验</title>
-  <link rel="stylesheet" href="/static/styles.css?v=0.10.3">
+  <link rel="stylesheet" href="/static/styles.css?v=0.11.0">
 </head>
 <body>
   <header class="topbar">
@@ -32,7 +32,7 @@
         <label>USER ID<input id="username" autocomplete="username" autofocus></label>
         <label>PASSWORD<input id="password" type="password" autocomplete="current-password" placeholder="已保存时可留空"></label>
         <label>OTP<input id="otp" inputmode="numeric" autocomplete="one-time-code"></label>
-        <label class="remember"><input id="remember" type="checkbox" checked> 保存用户名密码(使用 Windows DPAPI 加密)</label>
+        <label class="remember"><input id="remember" type="checkbox" checked> <span id="credential-label">保存用户名密码(使用 Windows DPAPI 加密)</span></label>
         <button id="login" class="login-button">Login</button>
         <div id="login-message" class="form-message"></div>
       </section>
@@ -79,7 +79,7 @@
     </section>
   </div>
   <div id="toast" role="status"></div>
-  <script src="/static/app.js?v=0.10.3"></script>
-  <script src="/static/local-first.js?v=0.10.3"></script>
+  <script src="/static/app.js?v=0.11.0"></script>
+  <script src="/static/local-first.js?v=0.11.0"></script>
 </body>
 </html>

@@ -2,6 +2,15 @@
 
 更新时间：2026-09-24
 
+## 2026-09-24 Windows/Linux 双系统运行（0.11.0）
+
+- 保留 Windows 的 `setup.bat`、`run.bat` 和 DPAPI 使用体验；
+- 新增 Linux 的 `setup.sh`、`run.sh`、`run_server.sh` 及 systemd 服务模板；
+- 安装程序自动创建虚拟环境，并按平台选择 Edge 或 Playwright Chromium；
+- Linux 凭据使用本机 Fernet 密钥加密，凭据文件和密钥权限限制为 `0600`，OTP 不保存；
+- `SMARTGPMS_DATA_DIR` 支持把业务数据与程序代码分离；
+- 当前仍保持单 SSO 会话和单后台浏览器，多用户会话隔离留待后续版本；
+
 ## 2026-09-24 通门证后台同步与本地 PDF 缓存（0.10.0）
 
 - `run.bat` 默认以 Edge/Chrome 应用窗口打开主界面，隐藏普通浏览器标签栏和地址栏；

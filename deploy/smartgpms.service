@@ -1,0 +1,22 @@
+[Unit]
+Description=smartGPMS gate-pass verification service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=smartgpms
+Group=smartgpms
+WorkingDirectory=/opt/smartgpms
+Environment=SMARTGPMS_DATA_DIR=/var/lib/smartgpms
+Environment=SMARTGPMS_HOST=127.0.0.1
+Environment=SMARTGPMS_PORT=8765
+ExecStart=/opt/smartgpms/.venv/bin/python -m uvicorn app:app --host ${SMARTGPMS_HOST} --port ${SMARTGPMS_PORT} --workers 1
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

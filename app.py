@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import threading
@@ -26,8 +27,8 @@ from smartgpms.service import SmartGPMSService
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
-DATA_DIR = BASE_DIR / "data"
-config = AppConfig(BASE_DIR)
+DATA_DIR = Path(os.environ.get("SMARTGPMS_DATA_DIR", BASE_DIR / "data")).resolve()
+config = AppConfig(BASE_DIR, data_root=DATA_DIR)
 database = Database(DATA_DIR / "smartgpms.sqlite3")
 database.activate_ocr_pipeline("das-photo-ai-orientation-fusion-v3")
 credentials = CredentialStore(DATA_DIR / "credentials.json")
@@ -44,7 +45,7 @@ async def lifespan(_: FastAPI):
     service.stop()
 
 
-app = FastAPI(title="smartGPMS", version="0.10.3", lifespan=lifespan)
+app = FastAPI(title="smartGPMS", version="0.11.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 

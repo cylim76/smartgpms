@@ -5,3 +5,4 @@ rapidocr>=3.7,<4.0
 onnxruntime>=1.20,<2.0
 Pillow>=11,<13
 playwright>=1.55,<2.0
+cryptography>=42,<50

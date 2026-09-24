@@ -1,8 +1,17 @@
 # smartGPMS 开发方案
 
-版本：0.1
+版本：0.11
+
+## Windows/Linux 双系统运行约束
+
+- 同一套 Python、前端和数据库代码支持 Windows 与 Linux；
+- Windows 保留 `setup.bat` / `run.bat`，Linux 使用对应 `.sh`；
+- Windows 凭据继续使用 DPAPI，Linux 使用服务器本机 Fernet 密钥；
+- Windows 后台浏览器优先使用 Edge，Linux 使用 Playwright Chromium；
+- Linux 无界面服务固定单 worker，避免重复创建 SSO 浏览器和后台同步任务；
+- 当前版本为单 SSO 会话，多用户会话隔离不属于本轮范围。
 状态：已确认，进入开发
-目标平台：门证担当的本地 Windows 电脑
+目标平台：门证担当的本地 Windows 电脑，以及受信任内网中的 Linux/Windows 服务端
 
 ## DAS 页面职责与状态边界
 
@@ -39,7 +48,7 @@ smartGPMS 用于在打印 DAS 门证前，复用 DAS 已有的四阶段集装箱
 采用“本地桌面外壳 + 网页式界面 + 后台浏览器会话 + Python 服务”的结构。
 
 ```text
-smartGPMS Windows 应用
+smartGPMS Windows/Linux Web 应用
 ├── 网页式工作台
 │   ├── 多箱号输入
 │   ├── SSO 登录区
@@ -59,7 +68,7 @@ smartGPMS Windows 应用
 └── SQLite / 本地缓存 / 打印证据
 ```
 
-不使用 Tkinter。网页式界面适合并排展示图片、OCR 文本、状态和打印信息；桌面外壳负责后台浏览器、Windows 凭据和打印能力。
+不使用 Tkinter。网页式界面适合并排展示图片、OCR 文本、状态和打印信息；服务端负责后台浏览器和平台对应的凭据加密，客户端浏览器负责最终打印。
 
 ## 3. 界面规格
 
@@ -125,7 +134,7 @@ smartGPMS Windows 应用
 ### 4.2 凭据保存
 
 - 用户名可保存在 SQLite；
-- 密码使用 Windows DPAPI 或 Credential Manager 加密，SQLite 只保存引用或密文；
+- Windows 密码使用 DPAPI 加密；Linux 密码使用权限受限的本机 Fernet 密钥加密；
 - OTP 永不保存；
 - 日志不得输出用户名、密码、OTP、Cookie 或完整会话令牌。
 
@@ -344,7 +353,7 @@ OCR 层采用接口化实现：
 4. **状态 4 处理**：自动下载、方向校正、裁剪、OCR和幂等重试。
 5. **门证核验**：多箱号、六行表格、绿红橙判定、图片放大。
 6. **打印审计**：打印/重打、状态 0→1、最后打印时间和不可变历史。
-7. **Windows 交付**：异常恢复、缓存治理、CPU 性能、安装和启动验证。
+7. **双系统交付**：异常恢复、缓存治理、CPU 性能、Windows/Linux 安装和启动验证。
 
 ## 13. 已知前置验证
 

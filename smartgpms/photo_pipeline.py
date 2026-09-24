@@ -100,7 +100,7 @@ class PhotoPipeline:
             or filename.endswith((" ", "."))
             or Path(filename).stem.upper() in reserved
         ):
-            raise ValueError(f"DAS 原始文件名无法在 Windows 中原样保存：{filename!r}")
+            raise ValueError(f"DAS 原始文件名无法跨平台安全保存：{filename!r}")
         return filename
 
     def process(

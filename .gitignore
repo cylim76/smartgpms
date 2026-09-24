@@ -12,6 +12,7 @@ data/evidence/
 data/gatepass/
 data/print-spool/
 data/credentials.json
+data/credential.key
 data/browser-profile/
 data/ui-smoke.png
 data/ui-results-smoke.png

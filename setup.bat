@@ -1,11 +1,22 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set "PYTHON_EXE=C:\Users\lg\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-if not exist "%PYTHON_EXE%" set "PYTHON_EXE=py"
-if not exist ".venv\Scripts\python.exe" %PYTHON_EXE% -m venv .venv
-".venv\Scripts\python.exe" -m pip install --upgrade pip
-".venv\Scripts\python.exe" -m pip install -r requirements.txt
+if exist ".venv\Scripts\python.exe" (
+  ".venv\Scripts\python.exe" "tools\setup_environment.py"
+) else (
+  where py >nul 2>nul
+  if not errorlevel 1 (
+    py -3 "tools\setup_environment.py"
+  ) else (
+    python "tools\setup_environment.py"
+  )
+)
+if errorlevel 1 (
+  echo.
+  echo Installation failed. Check the messages above.
+  pause
+  exit /b 1
+)
 echo.
 echo Installation complete. Run run.bat to start smartGPMS.
 pause
