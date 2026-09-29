@@ -42,6 +42,23 @@ class Database:
         finally:
             connection.close()
 
+    @staticmethod
+    def _ensure_columns(
+        connection: sqlite3.Connection,
+        table: str,
+        definitions: dict[str, str],
+    ) -> None:
+        """Bring an existing smartGPMS database up to the current schema."""
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        for name, definition in definitions.items():
+            if name not in columns:
+                connection.execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN "{name}" {definition}'
+                )
+
     def _initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(
@@ -203,6 +220,44 @@ class Database:
                     UNIQUE(job_type, cpm_id, status)
                 );
                 """
+            )
+            self._ensure_columns(
+                connection,
+                "cpm_records",
+                {
+                    "product_type": "TEXT NOT NULL DEFAULT ''",
+                    "packing_type": "TEXT NOT NULL DEFAULT ''",
+                    "upload_quantity": "TEXT NOT NULL DEFAULT ''",
+                    "seal_no": "TEXT NOT NULL DEFAULT ''",
+                    "stage1_confirmed_at": "TEXT NOT NULL DEFAULT ''",
+                    "stage2_confirmed_at": "TEXT NOT NULL DEFAULT ''",
+                    "stage3_confirmed_at": "TEXT NOT NULL DEFAULT ''",
+                    "stage4_confirmed_at": "TEXT NOT NULL DEFAULT ''",
+                    "service_year": "TEXT NOT NULL DEFAULT ''",
+                    "inspection_result": "TEXT NOT NULL DEFAULT ''",
+                    "das_process_status": "INTEGER NOT NULL DEFAULT 0",
+                    "archive_status": "INTEGER NOT NULL DEFAULT 0",
+                    "downloaded_photo_count": "INTEGER NOT NULL DEFAULT 0",
+                    "is_valid": "INTEGER NOT NULL DEFAULT 1",
+                    "superseded_by": "TEXT NOT NULL DEFAULT ''",
+                    "superseded_at": "TEXT",
+                },
+            )
+            self._ensure_columns(
+                connection,
+                "photo_cache",
+                {
+                    "thumbnail_path": "TEXT NOT NULL DEFAULT ''",
+                    "cleaned_at": "TEXT",
+                },
+            )
+            self._ensure_columns(
+                connection,
+                "ocr_cache",
+                {
+                    "cache_status": "TEXT NOT NULL DEFAULT 'ready'",
+                    "cleaned_at": "TEXT",
+                },
             )
             timestamp = now_text()
             connection.execute(

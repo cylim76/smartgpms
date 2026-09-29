@@ -1,3 +1,5 @@
+import sqlite3
+
 from smartgpms.database import Database
 
 
@@ -23,6 +25,58 @@ def test_new_database_uses_only_final_schema(tmp_path):
         "superseded_by",
         "superseded_at",
     } <= cpm_columns
+
+
+def test_existing_database_is_upgraded_to_current_columns(tmp_path):
+    path = tmp_path / "existing.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE cpm_records (
+            cpm_id TEXT PRIMARY KEY,
+            container_no TEXT NOT NULL,
+            begin_date TEXT NOT NULL DEFAULT '',
+            end_date TEXT NOT NULL DEFAULT '',
+            das_status_text TEXT NOT NULL DEFAULT '',
+            business_stage INTEGER NOT NULL DEFAULT 0,
+            photo_count INTEGER NOT NULL DEFAULT 0,
+            print_status INTEGER NOT NULL DEFAULT 0,
+            print_count INTEGER NOT NULL DEFAULT 0,
+            last_printed_at TEXT,
+            ocr_status TEXT NOT NULL DEFAULT 'pending',
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            last_checked_at TEXT NOT NULL
+        );
+        INSERT INTO cpm_records(
+            cpm_id,container_no,first_seen_at,last_seen_at,last_checked_at
+        ) VALUES('100','MSCU6639870','2026-09-01','2026-09-01','2026-09-01');
+        """
+    )
+    connection.close()
+
+    database = Database(path)
+    database.upsert_cpm(
+        {
+            "cpm_id": "100",
+            "container_no": "MSCU6639870",
+            "upload_quantity": "60",
+            "seal_no": "SEAL100",
+            "stage4_confirmed_at": "2026-09-29 12:00:00",
+            "service_year": "2026",
+            "inspection_result": "OK",
+            "das_process_status": 5,
+        }
+    )
+
+    record = database.cpm_by_id("100")
+    assert record["upload_quantity"] == "60"
+    assert record["seal_no"] == "SEAL100"
+    assert record["stage4_confirmed_at"] == "2026-09-29 12:00:00"
+    assert record["service_year"] == "2026"
+    assert record["inspection_result"] == "OK"
+    assert record["das_process_status"] == 5
+    assert record["superseded_by"] == ""
 
 
 def test_latest_cpm_and_print_state(tmp_path):
