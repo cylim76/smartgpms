@@ -13,6 +13,7 @@ def test_windows_entry_points_are_limited_to_desktop_and_service_management():
     assert (root / "run_win.bat").is_file()
     assert (root / "install_service.bat").is_file()
     assert (root / "uninstall_service.bat").is_file()
+    assert (root / "update.bat").is_file()
     assert not (root / "run_server.bat").exists()
 
 
@@ -54,6 +55,19 @@ def test_windows_service_scripts_pin_and_verify_winsw_and_manage_firewall():
     assert '"%SERVICE_EXE%" start' in install
     assert '"%SERVICE_EXE%" uninstall' in uninstall
     assert "firewall delete rule" in uninstall
+
+
+def test_windows_update_script_stops_pulls_and_restarts_with_failure_recovery():
+    root = Path(__file__).resolve().parents[1]
+    update = (root / "update.bat").read_text(encoding="utf-8")
+
+    assert "sc stop smartGPMS" in update
+    assert "git pull --ff-only" in update
+    assert "sc start smartGPMS" in update
+    assert "call :wait_for_state STOPPED 120" in update
+    assert "call :wait_for_state RUNNING 120" in update
+    assert ":pull_failed" in update
+    assert "Start-Process -FilePath '%~f0' -Verb RunAs" in update
 
 
 def test_windows_service_runner_forces_single_server_mode(monkeypatch):
