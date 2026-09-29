@@ -153,6 +153,16 @@ class DasBrowser:
         with self._lock:
             self._discard()
 
+    def logout(self) -> None:
+        """Remove persisted SSO cookies before closing the background browser."""
+        with self._lock:
+            if self._context is not None:
+                try:
+                    self._context.clear_cookies()
+                except Exception:
+                    LOGGER.debug("Unable to clear SSO cookies during logout", exc_info=True)
+            self._discard()
+
     @staticmethod
     def _looks_logged_out(url: str, source: str) -> bool:
         text = (url + " " + source[:12000]).lower()

@@ -10,8 +10,10 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@WORKING_DIRECTORY@
 Environment="SMARTGPMS_DATA_DIR=@DATA_DIRECTORY@"
 Environment="SMARTGPMS_RUN_MODE=server"
+Environment="SMARTGPMS_HOST=@HOST@"
+Environment="SMARTGPMS_PORT=@PORT@"
 Environment="PYTHONUNBUFFERED=1"
-ExecStart="@PYTHON_EXECUTABLE@" -m uvicorn app:app --host "@HOST@" --port @PORT@ --workers 1
+ExecStart="@PYTHON_EXECUTABLE@" -m tools.run_service
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=120

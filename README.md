@@ -36,6 +36,8 @@ Windows 的操作方式与原版本保持一致。检测到 Microsoft Edge 时�
 
 Windows 服务由固定版本的 WinSW 托管，不显示命令行或业务窗口。安装脚本校验 WinSW SHA-256，并只为“域/专用网络”添加 TCP 8765 入站规则。客户端关闭浏览器不会停止服务。
 
+服务模式会每 30 秒检查一次本地 Git 版本，但不会主动访问 GitHub。管理员可在项目目录手动执行 `git pull`；若只是代码变化，smartGPMS 会在当前核验或后台处理单元结束后验证新版并自动重启。若 `requirements.txt` 有变化，系统不会自动安装软件包，应运行 `setup_win.bat`（Linux 使用 `setup_linux.sh`）后再重启服务。首次安装此功能后需要人工重启一次，之后的代码更新才会自动检测。
+
 ```console
 sc query smartGPMS
 sc start smartGPMS
@@ -79,6 +81,8 @@ journalctl -u smartgpms -f
 服务器入口默认监听 `0.0.0.0:8765`，并且固定使用一个 Uvicorn worker。当前版本仍是单 SSO 会话架构，只能部署在受信任内网；正式开放给多个客户端前，应配置防火墙白名单、HTTPS/反向代理和应用访问认证。
 
 服务器模式没有业务窗口生命周期。Windows、Linux 或其他客户端关闭浏览器，只会关闭自己的页面，不会停止服务端；服务端应通过 Windows 服务管理器、`systemd` 或启动它的终端进行停止和重启。
+
+每天 23:59，服务等待当前浏览器操作完成后清除 SSO/DAS Cookie 并退出后台登录；第二天需要重新输入 OTP。门证与监装同步分别根据业务变化在 10、30、60 分钟之间自动调整；任一用户开始核验时，两类同步均恢复为 10 分钟。
 
 Linux 安装脚本使用 [deploy/smartgpms.service](deploy/smartgpms.service) 动态生成实际 unit。生产环境建议：
 

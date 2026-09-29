@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import uvicorn
+
+CONTROLLED_RESTART_EXIT_CODE = 75
 
 
 def main() -> None:
@@ -12,14 +15,32 @@ def main() -> None:
     host = os.environ.get("SMARTGPMS_HOST", "0.0.0.0")
     port = int(os.environ.get("SMARTGPMS_PORT", "8765"))
     root = Path(__file__).resolve().parents[1]
-    uvicorn.run(
-        "app:app",
-        host=host,
-        port=port,
-        workers=1,
-        access_log=False,
-        app_dir=str(root),
+    os.chdir(root)
+    from app import app, service
+
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            workers=1,
+            access_log=False,
+        )
     )
+
+    def wait_for_controlled_restart() -> None:
+        service.restart_requested.wait()
+        if service.restart_requested.is_set():
+            server.should_exit = True
+
+    threading.Thread(
+        target=wait_for_controlled_restart,
+        name="smartgpms-update-restart",
+        daemon=True,
+    ).start()
+    server.run()
+    if service.restart_requested.is_set():
+        raise SystemExit(CONTROLLED_RESTART_EXIT_CODE)
 
 
 if __name__ == "__main__":

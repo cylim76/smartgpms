@@ -673,14 +673,14 @@ def test_recent_maintenance_rechecks_only_incomplete_or_missing_photo_rows(tmp_p
         service.stop()
 
 
-def test_background_schedule_runs_only_from_0700_through_2359():
+def test_background_schedule_stops_at_nightly_logout_time():
     assert not SmartGPMSService._background_window_open(
         datetime.fromisoformat("2026-09-23T06:59:59+08:00")
     )
     assert SmartGPMSService._background_window_open(
         datetime.fromisoformat("2026-09-23T07:00:00+08:00")
     )
-    assert SmartGPMSService._background_window_open(
+    assert not SmartGPMSService._background_window_open(
         datetime.fromisoformat("2026-09-23T23:59:59+08:00")
     )
     assert not SmartGPMSService._background_window_open(
@@ -692,8 +692,90 @@ def test_gate_and_photo_sync_use_independent_default_intervals(tmp_path):
     config = AppConfig(tmp_path)
 
     assert config.gate_sync_interval_seconds == 10 * 60
-    assert config.photo_sync_interval_seconds == 20 * 60
+    assert config.photo_sync_interval_seconds == 10 * 60
+    assert config.quiet_sync_interval_seconds == 30 * 60
+    assert config.idle_sync_interval_seconds == 60 * 60
     assert config.photo_scan_batch_size == 20
+
+
+def test_gate_and_photo_schedules_back_off_independently_and_verify_resets_both(
+    tmp_path,
+):
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        Database(tmp_path / "data" / "test.sqlite3"),
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    empty_gate = {
+        "new": 0,
+        "updated": 0,
+        "departed": 0,
+        "queued": 0,
+        "busy": False,
+    }
+    empty_photo = {
+        "new": 0,
+        "updated": 0,
+        "downloads": 0,
+        "busy": False,
+    }
+    try:
+        for _ in range(3):
+            service._schedule_sync_result("gate", empty_gate)
+        assert service.sync_schedule_state()["gate"] == {
+            "empty_runs": 3,
+            "interval_seconds": 30 * 60,
+        }
+        assert service.sync_schedule_state()["photo"]["interval_seconds"] == 10 * 60
+
+        for _ in range(6):
+            service._schedule_sync_result("photo", empty_photo)
+        assert service.sync_schedule_state()["photo"] == {
+            "empty_runs": 6,
+            "interval_seconds": 60 * 60,
+        }
+
+        service.note_interactive()
+        assert service.sync_schedule_state() == {
+            "gate": {"empty_runs": 0, "interval_seconds": 10 * 60},
+            "photo": {"empty_runs": 0, "interval_seconds": 10 * 60},
+        }
+    finally:
+        service.stop()
+
+
+def test_nightly_logout_clears_browser_session_and_preserves_username(tmp_path):
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    database.update_session("logged_in", "operator", "会话有效")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+
+    class Browser:
+        logged_out = False
+
+        def logout(self):
+            self.logged_out = True
+
+        @staticmethod
+        def close():
+            return None
+
+    browser = Browser()
+    service.browser = browser
+    try:
+        current = datetime.fromisoformat("2026-09-24T23:59:00+08:00")
+        assert service._nightly_logout_due(current)
+        service._nightly_logout(current)
+
+        assert browser.logged_out
+        assert database.session()["status"] == "logged_out"
+        assert database.session()["username"] == "operator"
+        assert not service._nightly_logout_due(current)
+    finally:
+        service.stop()
 
 
 @pytest.mark.skip(reason="covered by bulk-export batching tests")
@@ -1053,8 +1135,8 @@ def test_gate_sync_excludes_departed_rows_and_cancels_cached_pdf_work(tmp_path):
 
         assert result == {
             "scanned": 0,
-            "new": 0,
-            "updated": 0,
+            "new": 1,
+            "updated": 1,
             "departed": 2,
             "queued": 0,
             "busy": False,

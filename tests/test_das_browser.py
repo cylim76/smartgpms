@@ -145,6 +145,29 @@ def test_session_check_discards_browser_after_target_closed(tmp_path):
     assert playwright.stopped
 
 
+def test_logout_clears_persistent_cookies_before_closing_browser(tmp_path):
+    browser = DasBrowser(AppConfig(tmp_path))
+
+    class LogoutContext(FakeContext):
+        cookies_cleared = False
+
+        def clear_cookies(self):
+            self.cookies_cleared = True
+
+    context = LogoutContext([FakePage()])
+    playwright = FakePlaywright(context)
+    browser._context = context
+    browser._playwright = playwright
+    browser._page = context.pages[0]
+
+    browser.logout()
+
+    assert context.cookies_cleared
+    assert context.closed
+    assert playwright.stopped
+    assert browser._context is None
+
+
 def test_gate_query_without_detail_link_is_not_found(tmp_path, monkeypatch):
     browser = DasBrowser(AppConfig(tmp_path))
 

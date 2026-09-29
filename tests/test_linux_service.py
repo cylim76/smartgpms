@@ -26,8 +26,9 @@ def test_systemd_unit_uses_resolved_installation_and_data_paths(tmp_path):
     assert f"WorkingDirectory={project_value}" in unit
     assert f'Environment="SMARTGPMS_DATA_DIR={data_value}"' in unit
     assert 'Environment="SMARTGPMS_RUN_MODE=server"' in unit
-    assert f'ExecStart="{python_value}" -m uvicorn' in unit
-    assert '--host "0.0.0.0" --port 8765 --workers 1' in unit
+    assert 'Environment="SMARTGPMS_HOST=0.0.0.0"' in unit
+    assert 'Environment="SMARTGPMS_PORT=8765"' in unit
+    assert f'ExecStart="{python_value}" -m tools.run_service' in unit
     assert not any(
         marker in unit
         for marker in ("@SERVICE_USER@", "@WORKING_DIRECTORY@", "@PORT@")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import threading
@@ -19,7 +20,9 @@ from .credentials import CredentialStore
 from .das_browser import DasBrowser, LoginRequired
 from .database import Database, now_text
 from .photo_pipeline import PhotoPipeline
+from .scheduling import AdaptiveSyncSchedule
 from .time_utils import business_now
+from .updater import GitRevisionMonitor
 
 LOGGER = logging.getLogger(__name__)
 ACTIVITY_RETENTION_SECONDS = 2 * 60 * 60
@@ -65,6 +68,28 @@ class SmartGPMSService:
         self._startup_sync_pending = True
         self._background_resume_at = 0.0
         self._background_window_active: bool | None = None
+        self._sync_schedule_lock = threading.Lock()
+        schedule_options = {
+            "active_seconds": config.gate_sync_interval_seconds,
+            "quiet_seconds": config.quiet_sync_interval_seconds,
+            "idle_seconds": config.idle_sync_interval_seconds,
+            "quiet_after": config.quiet_sync_after_runs,
+            "idle_after": config.idle_sync_after_runs,
+        }
+        self._gate_schedule = AdaptiveSyncSchedule(**schedule_options)
+        self._photo_schedule = AdaptiveSyncSchedule(
+            **{**schedule_options, "active_seconds": config.photo_sync_interval_seconds}
+        )
+        self._next_gate_sync_at = 0.0
+        self._next_photo_sync_at = 0.0
+        self._nightly_logout_date = ""
+        self.restart_requested = threading.Event()
+        self._run_mode = os.environ.get("SMARTGPMS_RUN_MODE", "desktop").strip().lower()
+        self._revision_monitor_enabled = self._run_mode == "server"
+        self._revision_monitor = GitRevisionMonitor(config.base_dir)
+        self._startup_revision = self._revision_monitor.current_revision()
+        self._rejected_revision = ""
+        self._next_revision_check_at = 0.0
 
     def log_activity(
         self,
@@ -108,6 +133,22 @@ class SmartGPMSService:
     def note_interactive(self) -> None:
         """Give interactive verification priority over new background OCR work."""
         self._background_resume_at = time.monotonic() + 60
+        now = time.monotonic()
+        changed = False
+        with self._sync_schedule_lock:
+            changed = self._gate_schedule.reset() or changed
+            changed = self._photo_schedule.reset() or changed
+            gate_target = now + self._gate_schedule.active_seconds
+            photo_target = now + self._photo_schedule.active_seconds
+            if not self._next_gate_sync_at or self._next_gate_sync_at > gate_target:
+                self._next_gate_sync_at = gate_target
+            if not self._next_photo_sync_at or self._next_photo_sync_at > photo_target:
+                self._next_photo_sync_at = photo_target
+        if changed:
+            self.log_activity(
+                "检测到用户核验操作，门证与监装同步已恢复为每10分钟",
+                source="schedule",
+            )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -115,6 +156,7 @@ class SmartGPMSService:
         self._stop.clear()
         self._drain_requested.clear()
         self._closed = False
+        self.restart_requested.clear()
         self._thread = threading.Thread(
             target=self._loop, name="smartgpms-background", daemon=True
         )
@@ -207,6 +249,7 @@ class SmartGPMSService:
             else:
                 self.credentials.clear()
             self.database.update_session("logged_in", username, "会话有效")
+            self._reset_sync_schedules(immediate=True)
             initial_import = self.initial_import_state()
             self._startup_sync_pending = not bool(initial_import["required"])
             self._background_resume_at = time.monotonic() + 15
@@ -595,6 +638,15 @@ class SmartGPMSService:
                 if not record["container_no"]:
                     continue
                 previous, saved = self.database.upsert_gate_pass(record)
+                changed = bool(
+                    previous
+                    and previous.get("source_fingerprint")
+                    != saved.get("source_fingerprint")
+                )
+                if previous is None:
+                    new += 1
+                elif changed:
+                    updated += 1
                 if self._gate_has_departed(record):
                     self.database.mark_gate_departed(
                         str(record["gate_key"]),
@@ -608,15 +660,6 @@ class SmartGPMSService:
                     departed += 1
                     continue
                 scanned += 1
-                changed = bool(
-                    previous
-                    and previous.get("source_fingerprint")
-                    != saved.get("source_fingerprint")
-                )
-                if previous is None:
-                    new += 1
-                elif changed:
-                    updated += 1
                 pdf_path = Path(str(saved.get("pdf_path", "")))
                 expected_pdf_path = self.gatepass_pdf_path(saved)
                 needs_pdf = (
@@ -849,10 +892,145 @@ class SmartGPMSService:
                 continue
         return None
 
+    def _reset_sync_schedules(self, *, immediate: bool = False) -> None:
+        now = time.monotonic()
+        with self._sync_schedule_lock:
+            self._gate_schedule.reset()
+            self._photo_schedule.reset()
+            self._next_gate_sync_at = (
+                0.0 if immediate else now + self._gate_schedule.active_seconds
+            )
+            self._next_photo_sync_at = (
+                0.0 if immediate else now + self._photo_schedule.active_seconds
+            )
+
+    def _sync_due(self, target: str, current: float) -> bool:
+        with self._sync_schedule_lock:
+            deadline = (
+                self._next_gate_sync_at
+                if target == "gate"
+                else self._next_photo_sync_at
+            )
+        return current >= deadline
+
+    @staticmethod
+    def _sync_result_changed(target: str, result: dict[str, Any]) -> bool:
+        fields = (
+            ("new", "updated", "queued")
+            if target == "gate"
+            else ("new", "updated", "downloads")
+        )
+        return any(int(result.get(name, 0) or 0) > 0 for name in fields)
+
+    def _schedule_sync_result(
+        self,
+        target: str,
+        result: dict[str, Any] | None,
+    ) -> None:
+        schedule = self._gate_schedule if target == "gate" else self._photo_schedule
+        label = "门证" if target == "gate" else "监装"
+        now = time.monotonic()
+        with self._sync_schedule_lock:
+            previous_interval = schedule.interval_seconds
+            if result is None or bool(result.get("busy")):
+                interval = schedule.active_seconds
+            else:
+                interval = schedule.observe(self._sync_result_changed(target, result))
+            if target == "gate":
+                self._next_gate_sync_at = now + interval
+            else:
+                self._next_photo_sync_at = now + interval
+        if interval != previous_interval:
+            self.log_activity(
+                f"{label}同步频率已调整为每{interval // 60}分钟",
+                source="schedule",
+            )
+
+    def sync_schedule_state(self) -> dict[str, dict[str, int]]:
+        """Expose deterministic scheduler state for diagnostics and tests."""
+        with self._sync_schedule_lock:
+            return {
+                "gate": {
+                    "empty_runs": self._gate_schedule.empty_runs,
+                    "interval_seconds": self._gate_schedule.interval_seconds,
+                },
+                "photo": {
+                    "empty_runs": self._photo_schedule.empty_runs,
+                    "interval_seconds": self._photo_schedule.interval_seconds,
+                },
+            }
+
+    def _nightly_logout_due(self, current: datetime) -> bool:
+        today = current.strftime("%Y-%m-%d")
+        scheduled = current.replace(
+            hour=self.config.nightly_logout_hour,
+            minute=self.config.nightly_logout_minute,
+            second=0,
+            microsecond=0,
+        )
+        return current >= scheduled and self._nightly_logout_date != today
+
+    def _nightly_logout(self, current: datetime) -> None:
+        self._nightly_logout_date = current.strftime("%Y-%m-%d")
+        previous = self.database.session()
+        if previous.get("status") != "logged_in":
+            return
+        self.log_activity(
+            "已到23:59，正在完成当前操作并退出后台登录",
+            source="session",
+        )
+        self._browser_call(self.browser.logout)
+        self.database.update_session(
+            "logged_out",
+            str(previous.get("username", "")),
+            "每日作业结束，后台登录已退出",
+        )
+        self._startup_sync_pending = False
+        self._reset_sync_schedules(immediate=False)
+        self.log_activity("后台登录已安全退出", source="session")
+
+    def _check_external_revision(self, monotonic_now: float) -> None:
+        if (
+            not self._revision_monitor_enabled
+            or monotonic_now < self._next_revision_check_at
+        ):
+            return
+        self._next_revision_check_at = (
+            monotonic_now + self.config.git_revision_check_seconds
+        )
+        current_revision = self._revision_monitor.current_revision()
+        if not current_revision or current_revision in {
+            self._startup_revision,
+            self._rejected_revision,
+        }:
+            return
+        result = self._revision_monitor.validate_revision(
+            self._startup_revision,
+            current_revision,
+        )
+        if result.valid:
+            with self._foreground_condition:
+                if self._foreground_tasks:
+                    return
+            self.log_activity(
+                "检测到本地代码已经更新，将在当前任务结束后自动重启",
+                source="update",
+            )
+            self.restart_requested.set()
+        else:
+            self._rejected_revision = current_revision
+            self.log_activity(
+                f"检测到代码更新但验证未通过：{result.message}",
+                "error",
+                "update",
+            )
+
     @staticmethod
     def _background_window_open(current: datetime | None = None) -> bool:
         current = current or business_now()
-        return 7 <= current.hour <= 23
+        if current.hour < 7 or current.hour > 23:
+            return False
+        return not (current.hour == 23 and current.minute >= 59)
 
     def _next_cache_cleanup(self, current: datetime | None = None) -> datetime:
         current = current or business_now()
@@ -1351,22 +1529,23 @@ class SmartGPMSService:
         return str(target)
 
     def _loop(self) -> None:
-        next_check = next_gate_sync = next_photo_sync = 0.0
+        next_check = 0.0
         next_cleanup = self._next_cache_cleanup()
 
         def check_gate_between_photo_batches() -> None:
-            nonlocal next_gate_sync
-            if time.monotonic() < next_gate_sync or self._drain_requested.is_set():
+            if (
+                not self._sync_due("gate", time.monotonic())
+                or self._drain_requested.is_set()
+            ):
                 return
+            result = None
             try:
-                self.sync_gate_passes(
+                result = self.sync_gate_passes(
                     business_now(),
                     _task_lock_owned=True,
                 )
             finally:
-                next_gate_sync = (
-                    time.monotonic() + self.config.gate_sync_interval_seconds
-                )
+                self._schedule_sync_result("gate", result)
 
         self.log_activity(
             f"缓存自动清理已计划于 {next_cleanup.strftime('%Y-%m-%d %H:%M')}",
@@ -1378,6 +1557,11 @@ class SmartGPMSService:
                     break
                 now = time.monotonic()
                 wall_now = business_now()
+                if self._nightly_logout_due(wall_now):
+                    self._nightly_logout(wall_now)
+                self._check_external_revision(now)
+                if self.restart_requested.is_set():
+                    break
                 if wall_now >= next_cleanup:
                     next_cleanup = self._next_cache_cleanup(
                         wall_now + timedelta(minutes=1)
@@ -1432,28 +1616,24 @@ class SmartGPMSService:
                 if not window_open and not initialization_exception:
                     continue
                 self._startup_sync_pending = False
-                if startup_sync or now >= next_gate_sync:
+                if startup_sync or self._sync_due("gate", now):
+                    gate_result = None
                     try:
-                        self.sync_gate_passes(wall_now)
+                        gate_result = self.sync_gate_passes(wall_now)
                     finally:
-                        next_gate_sync = (
-                            time.monotonic()
-                            + self.config.gate_sync_interval_seconds
-                        )
+                        self._schedule_sync_result("gate", gate_result)
                     if self._drain_requested.is_set():
                         break
                 if self.initial_import_state()["required"]:
                     continue
-                if startup_sync or now >= next_photo_sync:
+                if startup_sync or self._sync_due("photo", now):
+                    photo_result = None
                     try:
-                        self.sync_latest_window(
+                        photo_result = self.sync_latest_window(
                             gate_checkpoint=check_gate_between_photo_batches
                         )
                     finally:
-                        next_photo_sync = (
-                            time.monotonic()
-                            + self.config.photo_sync_interval_seconds
-                        )
+                        self._schedule_sync_result("photo", photo_result)
                 if (
                     not self._drain_requested.is_set()
                     and self.database.session().get("status") == "logged_in"

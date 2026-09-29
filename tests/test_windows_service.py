@@ -1,5 +1,10 @@
+import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from xml.etree import ElementTree
+
+import pytest
 
 
 def test_windows_entry_points_are_limited_to_desktop_and_service_management():
@@ -55,10 +60,31 @@ def test_windows_service_runner_forces_single_server_mode(monkeypatch):
     from tools import run_service
 
     captured = {}
-    monkeypatch.setattr(
-        run_service.uvicorn,
-        "run",
-        lambda target, **kwargs: captured.update(target=target, **kwargs),
+    restart_requested = threading.Event()
+
+    def fake_config(target, **kwargs):
+        captured.update(target=target, **kwargs)
+        return captured
+
+    class FakeServer:
+        should_exit = False
+
+        def __init__(self, config):
+            self.config = config
+
+        @staticmethod
+        def run():
+            return None
+
+    monkeypatch.setattr(run_service.uvicorn, "Config", fake_config)
+    monkeypatch.setattr(run_service.uvicorn, "Server", FakeServer)
+    monkeypatch.setitem(
+        sys.modules,
+        "app",
+        SimpleNamespace(
+            app="smartgpms-app",
+            service=SimpleNamespace(restart_requested=restart_requested),
+        ),
     )
     monkeypatch.setenv("SMARTGPMS_HOST", "10.0.0.8")
     monkeypatch.setenv("SMARTGPMS_PORT", "9876")
@@ -66,10 +92,45 @@ def test_windows_service_runner_forces_single_server_mode(monkeypatch):
     run_service.main()
 
     assert captured == {
-        "target": "app:app",
+        "target": "smartgpms-app",
         "host": "10.0.0.8",
         "port": 9876,
         "workers": 1,
         "access_log": False,
-        "app_dir": str(Path(run_service.__file__).resolve().parents[1]),
     }
+
+
+def test_service_runner_returns_controlled_restart_code(monkeypatch):
+    from tools import run_service
+
+    restart_requested = threading.Event()
+
+    class FakeServer:
+        should_exit = False
+
+        def __init__(self, _config):
+            return None
+
+        def run(self):
+            restart_requested.set()
+            deadline = threading.Event()
+            for _ in range(100):
+                if self.should_exit:
+                    break
+                deadline.wait(0.001)
+
+    monkeypatch.setattr(run_service.uvicorn, "Config", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_service.uvicorn, "Server", FakeServer)
+    monkeypatch.setitem(
+        sys.modules,
+        "app",
+        SimpleNamespace(
+            app="smartgpms-app",
+            service=SimpleNamespace(restart_requested=restart_requested),
+        ),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        run_service.main()
+
+    assert raised.value.code == run_service.CONTROLLED_RESTART_EXIT_CODE

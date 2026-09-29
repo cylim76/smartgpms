@@ -19,7 +19,11 @@ class AppConfig:
     )
     session_check_seconds: int = 600
     gate_sync_interval_seconds: int = 600
-    photo_sync_interval_seconds: int = 1200
+    photo_sync_interval_seconds: int = 600
+    quiet_sync_interval_seconds: int = 1800
+    idle_sync_interval_seconds: int = 3600
+    quiet_sync_after_runs: int = 3
+    idle_sync_after_runs: int = 6
     photo_scan_batch_size: int = 20
     bulk_sync_days: int = 30
     photo_retention_days: int = 30
@@ -28,6 +32,9 @@ class AppConfig:
     print_evidence_retention_days: int = 365
     cache_cleanup_hour: int = 12
     cache_cleanup_minute: int = 0
+    nightly_logout_hour: int = 23
+    nightly_logout_minute: int = 59
+    git_revision_check_seconds: int = 30
     cache_max_bytes: int = 20 * 1024 * 1024 * 1024
     cache_min_free_bytes: int = 10 * 1024 * 1024 * 1024
 
