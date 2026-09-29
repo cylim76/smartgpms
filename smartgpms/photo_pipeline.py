@@ -115,6 +115,153 @@ class PhotoPipeline:
         self.download(cpm_id, detail, progress)
         return self.recognize(cpm_id, detail, progress)
 
+    def begin_forced_refresh(
+        self,
+        cpm_id: str,
+        detail: dict[str, Any],
+        progress: Callable[[str, str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Download a complete replacement set before touching the active cache."""
+        stage4_photos = [
+            photo
+            for photo in detail.get("photos", [])
+            if int(photo.get("step_no", 0)) == 4
+        ]
+        if not stage4_photos:
+            raise RuntimeError("暂未发现新的封箱照片")
+        expected_container = str(detail.get("container_no", ""))
+        safe_container = "".join(
+            character
+            for character in expected_container.upper()
+            if character.isalnum()
+        )
+        period = self._storage_period(str(detail.get("begin_date", "")))
+        root = self.cache_dir.joinpath(
+            *period, f"{cpm_id}_{safe_container or 'UNKNOWN'}"
+        )
+        root.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(
+            tempfile.mkdtemp(dir=root.parent, prefix=f".{root.name}_refresh_")
+        )
+        thumbnail_root = staging / "_thumb"
+        snapshot = self.database.photo_refresh_state(cpm_id)
+        downloaded: list[dict[str, Any]] = []
+        occupied_names: dict[str, str] = {}
+        backup: Path | None = None
+        old_root_moved = False
+        swapped = False
+        self.database.update_ocr_status(cpm_id, "downloading")
+        try:
+            for index, photo in enumerate(stage4_photos, start=1):
+                source_url = str(photo.get("source_url", ""))
+                filename = self._original_filename(
+                    source_url, str(photo.get("label", ""))
+                )
+                collision_key = filename.casefold()
+                previous_url = occupied_names.get(collision_key)
+                if previous_url and previous_url != source_url:
+                    raise ValueError(
+                        f"DAS 两张照片的原始文件名重复，为避免覆盖已停止：{filename}"
+                    )
+                occupied_names[collision_key] = source_url
+                if progress:
+                    progress("download", f"重新下载封箱照片 {index}/{len(stage4_photos)}")
+                staged_source = staging / filename
+                response = self.browser.download(source_url, staged_source)
+                staged_thumbnail = self._ensure_thumbnail(
+                    staged_source,
+                    thumbnail_root / f"{staged_source.stem}_thumb.jpg",
+                )
+                downloaded.append(
+                    {
+                        **photo,
+                        "filename": filename,
+                        "thumbnail_filename": staged_thumbnail.name,
+                        "source_hash": response["sha256"],
+                        "downloaded_at": now_text(),
+                    }
+                )
+
+            if root.exists():
+                backup = Path(
+                    tempfile.mkdtemp(dir=root.parent, prefix=f".{root.name}_backup_")
+                )
+                backup.rmdir()
+                root.replace(backup)
+                old_root_moved = True
+            staging.replace(root)
+            swapped = True
+            for photo in downloaded:
+                filename = str(photo.pop("filename"))
+                thumbnail_filename = str(photo.pop("thumbnail_filename"))
+                self.database.save_photo(
+                    cpm_id,
+                    {
+                        **photo,
+                        "local_path": str(root / filename),
+                        "thumbnail_path": str(root / "_thumb" / thumbnail_filename),
+                        "cache_status": "ready",
+                    },
+                )
+            count = len(downloaded)
+            self.database.update_photo_inventory(cpm_id, count, count)
+            if count >= 3:
+                self.database.mark_archive_status(cpm_id, 5)
+            else:
+                self.database.mark_archive_status(
+                    cpm_id, min(4, int(detail.get("business_stage", 4)))
+                )
+            self.database.update_ocr_status(cpm_id, "queued")
+            return {
+                "cpm_id": cpm_id,
+                "root": root,
+                "backup": backup,
+                "snapshot": snapshot,
+                "source_urls": {
+                    str(photo.get("source_url", "")) for photo in downloaded
+                },
+                "downloaded_photo_count": count,
+                "business_stage": int(detail.get("business_stage", 4)),
+            }
+        except Exception:
+            if swapped:
+                if root.exists():
+                    shutil.rmtree(root)
+                if backup is not None and backup.exists():
+                    backup.replace(root)
+                self.database.restore_photo_refresh_state(cpm_id, snapshot)
+            elif staging.exists():
+                shutil.rmtree(staging)
+                if old_root_moved and backup is not None and backup.exists():
+                    backup.replace(root)
+                self.database.restore_photo_refresh_state(cpm_id, snapshot)
+            raise
+
+    def commit_forced_refresh(self, context: dict[str, Any]) -> None:
+        cpm_id = str(context["cpm_id"])
+        self.database.delete_photos_except(
+            cpm_id, set(context.get("source_urls", set()))
+        )
+        count = int(context.get("downloaded_photo_count", 0))
+        self.database.update_photo_inventory(cpm_id, count, count)
+        self.database.mark_archive_status(
+            cpm_id,
+            5 if count >= 3 else min(4, int(context.get("business_stage", 4))),
+        )
+        backup = context.get("backup")
+        if isinstance(backup, Path) and backup.exists():
+            shutil.rmtree(backup)
+
+    def rollback_forced_refresh(self, context: dict[str, Any]) -> None:
+        cpm_id = str(context["cpm_id"])
+        root = Path(context["root"])
+        backup = context.get("backup")
+        if root.exists():
+            shutil.rmtree(root)
+        if isinstance(backup, Path) and backup.exists():
+            backup.replace(root)
+        self.database.restore_photo_refresh_state(cpm_id, context["snapshot"])
+
     def download(
         self,
         cpm_id: str,

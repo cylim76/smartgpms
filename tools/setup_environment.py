@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_DIR = ROOT / ".venv"
+PLAYWRIGHT_BROWSERS_DIR = ROOT / ".playwright-browsers"
 
 
 def _venv_python() -> Path:
@@ -19,9 +20,9 @@ def _venv_python() -> Path:
     return VENV_DIR / "bin" / "python"
 
 
-def _run(command: list[str]) -> None:
+def _run(command: list[str], *, env: dict[str, str] | None = None) -> None:
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, cwd=ROOT, check=True)
+    subprocess.run(command, cwd=ROOT, check=True, env=env)
 
 
 def _venv_ready() -> bool:
@@ -62,9 +63,12 @@ def _install_browser(python: Path, skip_browser: bool) -> None:
     if skip_browser:
         print("已跳过 Playwright 浏览器安装。")
         return
+    browser_env = {
+        **os.environ,
+        "PLAYWRIGHT_BROWSERS_PATH": str(PLAYWRIGHT_BROWSERS_DIR),
+    }
     if os.name == "nt" and _windows_edge_available():
-        print("已检测到 Microsoft Edge，将复用本机 Edge。")
-        return
+        print("已检测到 Microsoft Edge；同时安装服务模式备用 Chromium。")
     if sys.platform.startswith("linux"):
         _run(
             [
@@ -74,10 +78,14 @@ def _install_browser(python: Path, skip_browser: bool) -> None:
                 "install",
                 "--with-deps",
                 "chromium",
-            ]
+            ],
+            env=browser_env,
         )
         return
-    _run([str(python), "-m", "playwright", "install", "chromium"])
+    _run(
+        [str(python), "-m", "playwright", "install", "chromium"],
+        env=browser_env,
+    )
 
 
 def main() -> int:

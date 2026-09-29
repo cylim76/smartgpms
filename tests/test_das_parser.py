@@ -1,10 +1,10 @@
 from smartgpms.das_parser import (
     find_cpm_id,
     find_gate_postback,
-    find_latest_cpm_id,
     parse_cpm_detail,
     parse_cpm_search_rows,
     parse_gate_detail,
+    parse_gate_export_rows,
     parse_gate_search_rows,
     parse_process_status,
 )
@@ -109,15 +109,6 @@ def test_find_cpm_id_from_hidden_field_or_url():
     )
 
 
-def test_latest_cpm_id_uses_first_result_row():
-    source = """
-    <table><tr><th>CPMID</th></tr>
-    <tr><td><a href="V_CPM_DETAIL.aspx?cpm_id=9910">9910</a></td></tr>
-    <tr><td><a href="V_CPM_DETAIL.aspx?cpm_id=9909">9909</a></td></tr></table>
-    """
-    assert find_latest_cpm_id(source) == "9910"
-
-
 def test_parse_cpm_search_rows_extracts_metadata_and_stage():
     source = """
     <table id="dgMain"><tr><th>序号</th><th>检查序号</th></tr>
@@ -138,6 +129,36 @@ def test_parse_cpm_search_rows_extracts_metadata_and_stage():
     assert rows[0]["product_type"] == "空调"
     assert rows[0]["packing_type"] == "整箱"
     assert rows[1]["business_stage"] == 2
-    assert rows[1]["latest_stage_code"] == "U2"
     assert rows[2]["das_process_status"] == 5
     assert rows[2]["business_stage"] == 4
+
+
+def test_parse_full_cpm_export_metadata_without_a_row_limit():
+    rows = parse_cpm_search_rows(
+        """<table><tr><td>1</td><td>100256</td><td>TRHU5107393</td>
+        <td><a href='V_CPM_DETAIL.aspx?cpm_id=100256'>5.铅封确认</a></td>
+        <td>2026-09-18 15:59:13</td><td>2026-09-22 19:51:13</td>
+        <td>空调</td><td>整箱</td><td>60</td><td>CNEH47357</td>
+        <td>2026-09-18 16:01:49</td><td>2026-09-22 15:31:50</td>
+        <td>2026-09-22 19:49:31</td><td>2026-09-22 19:51:13</td>
+        <td>2021</td><td>TA装箱前点检-OK</td></tr></table>""",
+        limit=None,
+    )
+
+    assert rows[0]["upload_quantity"] == "60"
+    assert rows[0]["seal_no"] == "CNEH47357"
+    assert rows[0]["stage4_confirmed_at"] == "2026-09-22 19:51:13"
+    assert rows[0]["service_year"] == "2021"
+
+
+def test_parse_gate_export_rows_without_interactive_columns():
+    rows = parse_gate_export_rows(
+        """<table><tr><td>2026-09-24</td><td>OWM</td><td>PASS1</td>
+        <td>厂家</td><td></td><td></td><td>备注</td><td>TRHU5107393</td>
+        <td>CNEH47357</td><td>60</td><td>返出完了(eGate)</td>
+        <td>2026-09-24 08:49</td><td>2026-09-24 09:30</td></tr></table>"""
+    )
+
+    assert rows[0]["container_no"] == "TRHU5107393"
+    assert rows[0]["actual_departure_at"] == "2026-09-24 09:30"
+    assert rows[0]["sequence_no"] == ""

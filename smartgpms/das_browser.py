@@ -13,10 +13,10 @@ from typing import Any
 from .config import AppConfig
 from .das_parser import (
     find_cpm_id,
-    find_latest_cpm_id,
     parse_cpm_detail,
     parse_cpm_search_rows,
     parse_gate_detail,
+    parse_gate_export_rows,
     parse_gate_search_rows,
 )
 from .time_utils import business_now
@@ -93,6 +93,9 @@ class DasBrowser:
                 except Exception:  # noqa: BLE001 - stale contexts must be rebuilt
                     self._discard()
             try:
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(
+                    self.config.base_dir / ".playwright-browsers"
+                )
                 from playwright.sync_api import Error as PlaywrightError
                 from playwright.sync_api import sync_playwright
             except ImportError as exc:
@@ -267,44 +270,30 @@ class DasBrowser:
                 raise LoginRequired("DAS 会话已失效")
             return page
 
-    def latest_cpm_id(self) -> str:
-        """Open the DAS CPM photo page, run its query, and read the first row."""
-        with self._lock:
-            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    def _save_excel_export(self, page, prefix: str) -> str:
+        """Download a WebForms Excel export into app-owned storage and read it."""
+        button = page.locator("#btnExcel")
+        if not button.count():
+            raise DasBrowserError("DAS 页面中未找到 Excel 导出按钮")
+        self.config.sync_export_dir.mkdir(parents=True, exist_ok=True)
+        stamp = business_now().strftime("%Y%m%d_%H%M%S_%f")
+        target = self.config.sync_export_dir / f"{prefix}_{stamp}.xls"
+        try:
+            with page.expect_download(timeout=180_000) as download_info:
+                button.first.click()
+            download = download_info.value
+            failure = download.failure()
+            if failure:
+                raise DasBrowserError(f"DAS Excel 明细下载失败：{failure}")
+            download.save_as(str(target))
+            if not target.is_file() or target.stat().st_size < 100:
+                raise DasBrowserError("DAS Excel 明细下载结果为空")
+            return target.read_text(encoding="utf-8", errors="replace")
+        finally:
+            target.unlink(missing_ok=True)
 
-            page = self.refresh_das()
-            page.goto(
-                self.config.cpm_index_url,
-                wait_until="domcontentloaded",
-                timeout=45_000,
-            )
-            source = page.content()
-            if self._looks_logged_out(page.url, source):
-                raise LoginRequired("打开 DAS 照片列表页时会话已失效")
-            buttons = page.locator("input[type=submit], input[type=button], button")
-            for index in range(buttons.count()):
-                button = buttons.nth(index)
-                label = " ".join(
-                    filter(None, [button.get_attribute("value"), button.inner_text()])
-                ).lower()
-                if re.search(r"query|search|查询|检索", label):
-                    try:
-                        button.click()
-                        page.wait_for_load_state("domcontentloaded", timeout=10_000)
-                    except PlaywrightTimeoutError:
-                        page.wait_for_timeout(1500)
-                    break
-            source = page.content()
-            latest = find_latest_cpm_id(source)
-            if not latest:
-                raise DasBrowserError(
-                    "DAS 照片列表页已打开，但未能识别最新监装记录"
-                )
-            self._page = page
-            return latest
-
-    def cpm_snapshot(self, limit: int = 500) -> list[dict]:
-        """Query the CPM search page and return its newest metadata rows."""
+    def cpm_export_snapshot(self, start_date: str, end_date: str) -> list[dict]:
+        """Export and parse every CPM row in the requested date range."""
         with self._lock:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
@@ -314,13 +303,21 @@ class DasBrowser:
                 wait_until="domcontentloaded",
                 timeout=60_000,
             )
-            source = page.content()
-            if self._looks_logged_out(page.url, source):
+            if self._looks_logged_out(page.url, page.content()):
                 raise LoginRequired("打开 DAS 照片列表页时会话已失效")
-            button = page.locator("#btnSearch")
-            if not button.count():
-                raise DasBrowserError("DAS 照片列表页中未找到查询按钮 btnSearch")
-            response_source = ""
+            for selector, value in (
+                ("#txt_Date1", start_date),
+                ("#txt_Date2", end_date),
+            ):
+                field = page.locator(selector)
+                if field.count():
+                    field.first.fill(value)
+            container_field = page.locator("#txtCntrNo")
+            if container_field.count():
+                container_field.first.fill("")
+            search = page.locator("#btnSearch")
+            if not search.count():
+                raise DasBrowserError("DAS 照片列表页中未找到查询按钮")
             try:
                 with page.expect_response(
                     lambda response: (
@@ -328,17 +325,16 @@ class DasBrowser:
                         and response.request.method == "POST"
                     ),
                     timeout=90_000,
-                ) as response_info:
-                    button.first.click()
-                response_source = response_info.value.text()
+                ):
+                    search.first.click()
             except PlaywrightTimeoutError:
-                LOGGER.warning("Timed out waiting for CPM AJAX response; using DOM")
-            rows = parse_cpm_search_rows(response_source, limit)
-            if not rows:
+                LOGGER.warning("Timed out waiting for CPM export query response")
                 page.wait_for_timeout(1000)
-                rows = parse_cpm_search_rows(page.content(), limit)
+            rows = parse_cpm_search_rows(
+                self._save_excel_export(page, "CPM_LIST"), limit=None
+            )
             if not rows:
-                raise DasBrowserError("DAS 照片列表查询成功，但没有解析到检查记录")
+                raise DasBrowserError("DAS 监装 Excel 已下载，但没有解析到记录")
             self._page = page
             return rows
 
@@ -500,6 +496,46 @@ class DasBrowser:
                     raise DasBrowserError("DAS 门证列表翻页超时") from exc
             self._page = page
             return records
+
+    def gate_pass_export_snapshot(
+        self, start_date: str, end_date: str
+    ) -> list[dict[str, str]]:
+        """Export and parse every gate-pass row in the requested date range."""
+        with self._lock:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+            page = self.refresh_das()
+            for selector, value in (
+                ("#txt_BeginDate", start_date),
+                ("#txt_EndDate", end_date),
+            ):
+                field = page.locator(selector)
+                if field.count():
+                    field.first.fill(value)
+            container_field = page.locator("#txt_s_container_no")
+            if container_field.count():
+                container_field.first.fill("")
+            button = page.locator("#btnSearch")
+            if not button.count():
+                raise DasBrowserError("DAS 门证页面未找到查询按钮")
+            grid = page.locator("#dgMain")
+            before = grid.inner_html() if grid.count() else ""
+            button.first.click()
+            try:
+                page.wait_for_function(
+                    "before => (document.querySelector('#dgMain')?.innerHTML || '') !== before",
+                    arg=before,
+                    timeout=90_000,
+                )
+            except PlaywrightTimeoutError:
+                page.wait_for_timeout(1000)
+            rows = parse_gate_export_rows(
+                self._save_excel_export(page, "GERP_GATEPASS_LIST")
+            )
+            if not rows:
+                raise DasBrowserError("DAS 门证 Excel 已下载，但没有解析到记录")
+            self._page = page
+            return rows
 
     def open_gate_detail(
         self, container_no: str, gate_pass_no: str = ""

@@ -64,7 +64,7 @@ async def lifespan(_: FastAPI):
     service.stop()
 
 
-app = FastAPI(title="smartGPMS", version="0.14.1", lifespan=lifespan)
+app = FastAPI(title="smartGPMS", version="0.16.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -83,13 +83,17 @@ class GateVerifyPayload(BaseModel):
     container: str
 
 
+class PhotoRefreshPayload(BaseModel):
+    container: str
+
+
 class GateNoticeAckPayload(BaseModel):
     gate_key: str
     planned_departure_at: str
 
 
 class InitialImportPayload(BaseModel):
-    count: int = 500
+    confirm: bool = True
 
 
 class PrintPayload(BaseModel):
@@ -308,11 +312,6 @@ def bootstrap():
         "version": app.version,
         "session": database.session(),
         "credentials": credentials.public(),
-        "sync_interval_seconds": config.photo_sync_interval_seconds,
-        "gate_sync_interval_seconds": config.gate_sync_interval_seconds,
-        "photo_sync_interval_seconds": config.photo_sync_interval_seconds,
-        "ocr_engine": "RapidOCR / ONNX Runtime CPU",
-        "database": database.stats(),
         "initial_import": service.initial_import_state(),
     }
 
@@ -339,11 +338,6 @@ def _login(payload: LoginPayload):
         ) from exc
 
 
-@app.post("/api/session/check")
-def check_session():
-    return service.check_session()
-
-
 @app.get("/api/session/status")
 def session_status():
     """Return the last background-verified state without opening DAS."""
@@ -356,18 +350,10 @@ def session_status():
 @app.post("/api/initial-import")
 def configure_initial_import(payload: InitialImportPayload):
     _logged_in_username()
-    try:
-        state = service.configure_initial_import(payload.count)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not payload.confirm:
+        raise HTTPException(status_code=400, detail="请确认首次初始化")
+    state = service.configure_initial_import()
     return {"ok": True, **state}
-
-
-@app.post("/api/sync")
-def sync_now():
-    if database.session().get("status") != "logged_in":
-        raise HTTPException(status_code=401, detail="请先登录 SSO")
-    return _run_foreground(service.sync_latest_window)
 
 
 @app.get("/api/activity")
@@ -395,11 +381,6 @@ def acknowledge_gate_departure(payload: GateNoticeAckPayload):
     if not acknowledged:
         raise HTTPException(status_code=404, detail="待出厂门证记录已更新，请刷新列表")
     return {"ok": True}
-
-
-@app.post("/api/verify")
-def verify(payload: VerifyPayload):
-    return _run_foreground(_verify, payload)
 
 
 def _verify(payload: VerifyPayload):
@@ -430,18 +411,19 @@ def _verify(payload: VerifyPayload):
             )
             continue
         record = database.latest_valid_cpm(number)
+        resolved: dict[str, Any] = {}
         gate: dict[str, Any] | None = None
         gate_status = "unknown"
-        if not record:
-            try:
-                resolved = service.resolve_container(number)
-                record = resolved.get("record")
-                gate = resolved.get("gate")
-                gate_status = resolved.get("gate_status", "unknown")
-            except LoginRequired as exc:
-                database.update_session("logged_out", message=str(exc))
-                raise HTTPException(status_code=401, detail=str(exc)) from exc
-            except Exception:  # noqa: BLE001 - return a review row for this container
+        try:
+            resolved = service.resolve_container(number)
+            record = resolved.get("record") or record
+            gate = resolved.get("gate")
+            gate_status = resolved.get("gate_status", "unknown")
+        except LoginRequired as exc:
+            database.update_session("logged_out", message=str(exc))
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except Exception:  # noqa: BLE001 - return a review row for this container
+            if not record:
                 rows.append(
                     {
                         "input_container": number,
@@ -620,8 +602,34 @@ def verify_local(payload: VerifyPayload):
 @app.post("/api/verify/gate")
 def verify_gate(payload: GateVerifyPayload):
     """Complete one locally rendered row with fresh DAS photo and gate data."""
-    result = verify(VerifyPayload(containers=[payload.container]))
+    result = _run_foreground(
+        _verify, VerifyPayload(containers=[payload.container])
+    )
     return {"row": (result.get("rows") or [{}])[0]}
+
+
+@app.post("/api/photos/refresh")
+def refresh_photos(payload: PhotoRefreshPayload):
+    _logged_in_username()
+    number = normalize(payload.container)
+    if len(number) != 11 or not validate_container_number(number):
+        raise HTTPException(status_code=400, detail="箱号格式或校验位不正确")
+    try:
+        refreshed = _run_foreground(service.refresh_container_photos, number)
+    except LoginRequired as exc:
+        database.update_session("logged_out", message=str(exc))
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except (RuntimeError, ValueError, DasBrowserError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    local = verify_local(VerifyPayload(containers=[number]))
+    row = (local.get("rows") or [{}])[0]
+    count = int(refreshed.get("downloaded_photo_count", 0))
+    message = (
+        f"已采用最新监装记录并更新 {count} 张封箱照片"
+        if refreshed.get("changed_cpm")
+        else f"已更新 {count} 张封箱照片"
+    )
+    return {"row": row, "message": message}
 
 
 @app.get("/api/crop/{cpm_id}/{target_type}")

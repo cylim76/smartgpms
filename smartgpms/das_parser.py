@@ -94,7 +94,6 @@ class CpmDetail:
     status_text: str = ""
     business_stage: int = 0
     das_process_status: int = 0
-    latest_stage_code: str = ""
     photos: list[DasPhoto] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -133,9 +132,6 @@ def parse_cpm_detail(source: str, page_url: str = "", cpm_id: str = "") -> CpmDe
     highest = max(
         min(process_status, 4), max((photo.step_no for photo in photos), default=0)
     )
-    latest_code = next(
-        (code for code, stage in STEP_INFO.items() if stage == highest), ""
-    )
     return CpmDetail(
         cpm_id=cpm_id,
         container_no=element_text(source, "lbCntrNo")
@@ -150,7 +146,6 @@ def parse_cpm_detail(source: str, page_url: str = "", cpm_id: str = "") -> CpmDe
         status_text=status_text,
         business_stage=highest,
         das_process_status=process_status,
-        latest_stage_code=latest_code,
         photos=photos,
     )
 
@@ -210,6 +205,40 @@ def parse_gate_search_rows(source: str, page_url: str = "") -> list[dict[str, st
     return records
 
 
+def parse_gate_export_rows(source: str) -> list[dict[str, str]]:
+    """Parse the Excel/HTML export, which omits the two interactive columns."""
+    records: list[dict[str, str]] = []
+    for row in re.findall(r"<tr\b[^>]*>.*?</tr>", source, re.IGNORECASE | re.DOTALL):
+        cells = re.findall(r"<td\b[^>]*>(.*?)</td>", row, re.IGNORECASE | re.DOTALL)
+        if len(cells) < 13:
+            continue
+        values = [strip_tags(cell).replace("\xa0", "").strip() for cell in cells]
+        container_no = re.sub(r"[^A-Z0-9]", "", values[7].upper())
+        if not re.fullmatch(r"[A-Z]{4}\d{7}", container_no):
+            continue
+        records.append(
+            {
+                "application_date": values[0],
+                "gate_type": values[1],
+                "gate_pass_no": values[2],
+                "vendor_name": values[3],
+                "vehicle_no": values[4],
+                "returner": values[5],
+                "remark": values[6],
+                "container_no": container_no,
+                "seal_no": re.sub(r"\s+", "", values[8].upper()),
+                "return_quantity": values[9],
+                "process_status": values[10],
+                "planned_departure_at": values[11],
+                "actual_departure_at": values[12],
+                "sequence_no": "",
+                "status_url": "",
+                "event_target": "",
+            }
+        )
+    return records
+
+
 def find_cpm_id(source: str, page_url: str = "") -> str:
     """Find a CPMID exposed by a gate result/detail page, if DAS provides one."""
     query = parse_qs(urlparse(page_url).query)
@@ -247,20 +276,9 @@ def find_cpm_id(source: str, page_url: str = "") -> str:
     return scripted.group(1) if scripted else ""
 
 
-def find_latest_cpm_id(source: str) -> str:
-    """Return the first CPMID row from a newest-first DAS CPM result table."""
-    for row in re.findall(r"<tr\b[^>]*>.*?</tr>", source, re.IGNORECASE | re.DOTALL):
-        candidate = find_cpm_id(row)
-        if candidate:
-            return candidate
-    candidates = re.findall(r"[?&]cpm[_-]?id=(\d+)", source, re.IGNORECASE)
-    return candidates[0] if candidates else ""
-
-
-def parse_cpm_search_rows(source: str, limit: int = 500) -> list[dict]:
+def parse_cpm_search_rows(source: str, limit: int | None = 500) -> list[dict]:
     """Parse newest-first metadata rows from the DAS CPM search result table."""
     records: list[dict] = []
-    stage_codes = {1: "U1", 2: "U2", 3: "U3", 4: "S1"}
     for row in re.findall(r"<tr\b[^>]*>.*?</tr>", source, re.IGNORECASE | re.DOTALL):
         cpm_id = find_cpm_id(row)
         if not cpm_id:
@@ -283,15 +301,22 @@ def parse_cpm_search_rows(source: str, limit: int = 500) -> list[dict]:
                 "end_date": values[5] if len(values) > 5 else "",
                 "product_type": values[6] if len(values) > 6 else "",
                 "packing_type": values[7] if len(values) > 7 else "",
+                "upload_quantity": values[8] if len(values) > 8 else "",
+                "seal_no": re.sub(r"\s+", "", values[9].upper()) if len(values) > 9 else "",
+                "stage1_confirmed_at": values[10] if len(values) > 10 else "",
+                "stage2_confirmed_at": values[11] if len(values) > 11 else "",
+                "stage3_confirmed_at": values[12] if len(values) > 12 else "",
+                "stage4_confirmed_at": values[13] if len(values) > 13 else "",
+                "service_year": values[14] if len(values) > 14 else "",
+                "inspection_result": values[15] if len(values) > 15 else "",
                 "das_status_text": status_text,
                 "business_stage": stage,
                 "das_process_status": process_status,
-                "latest_stage_code": stage_codes.get(stage, ""),
                 "photo_count": 0,
                 "is_valid": True,
             }
         )
-        if len(records) >= limit:
+        if limit is not None and len(records) >= limit:
             break
     return records
 

@@ -112,7 +112,11 @@ def test_linux_browser_uses_playwright_chromium_without_edge_channel(
         "sync_playwright",
         lambda: FakeStarter(fake_playwright),
     )
-    monkeypatch.setattr(das_browser_module, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(
+        das_browser_module,
+        "os",
+        SimpleNamespace(name="posix", environ={}),
+    )
 
     assert browser._ensure() is context
     options = fake_playwright.chromium.calls[0][1]
@@ -293,3 +297,57 @@ def test_export_current_gate_pdf_uses_print_media(tmp_path):
     assert page.media == ["print", "screen"]
     assert page.pdf_options["print_background"] is True
     assert page.pdf_options["prefer_css_page_size"] is True
+
+
+def test_excel_export_waits_for_download_and_removes_temporary_file(tmp_path):
+    content = "<table><tr><td>complete export</td></tr></table>"
+
+    class Download:
+        @staticmethod
+        def failure():
+            return None
+
+        @staticmethod
+        def save_as(path):
+            Path(path).write_text(content * 4, encoding="utf-8")
+
+    class DownloadInfo:
+        value = Download()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class Button:
+        first = None
+
+        def __init__(self):
+            self.first = self
+
+        @staticmethod
+        def count():
+            return 1
+
+        @staticmethod
+        def click():
+            return None
+
+    class ExportPage:
+        @staticmethod
+        def locator(selector):
+            assert selector == "#btnExcel"
+            return Button()
+
+        @staticmethod
+        def expect_download(**options):
+            assert options["timeout"] == 180_000
+            return DownloadInfo()
+
+    browser = DasBrowser(AppConfig(tmp_path))
+
+    source = browser._save_excel_export(ExportPage(), "CPM_LIST")
+
+    assert source == content * 4
+    assert list(browser.config.sync_export_dir.glob("*.xls")) == []

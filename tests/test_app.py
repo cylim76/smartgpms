@@ -38,6 +38,54 @@ def test_local_verification_returns_without_opening_das(tmp_path, monkeypatch):
     assert result["rows"][0]["gate_container_no"] == ""
 
 
+def test_full_verification_refreshes_mapping_even_when_local_record_exists(
+    tmp_path, monkeypatch
+):
+    database = Database(tmp_path / "smartgpms.sqlite3")
+    for cpm_id in ("100", "200"):
+        database.upsert_cpm(
+            {
+                "cpm_id": cpm_id,
+                "container_no": "CAAU5328959",
+                "business_stage": 4,
+                "das_process_status": 5,
+            }
+        )
+    new_record = database.cpm_by_id("200")
+    monkeypatch.setattr(app_module, "database", database)
+    monkeypatch.setattr(app_module.service, "note_interactive", lambda: None)
+    monkeypatch.setattr(app_module.service, "log_activity", lambda *_a, **_k: None)
+    calls = []
+
+    def resolve(container_no):
+        calls.append(container_no)
+        return {"record": new_record, "gate": None, "gate_status": "unknown"}
+
+    monkeypatch.setattr(app_module.service, "resolve_container", resolve)
+    monkeypatch.setattr(
+        app_module.service,
+        "prepare_container",
+        lambda _number: {**new_record, "container_ocr": None, "seal_ocr": None},
+    )
+    monkeypatch.setattr(
+        app_module.service.browser,
+        "open_gate_detail",
+        lambda _number: {
+            "container_no": "CAAU5328959",
+            "seal_no": "CN123456",
+            "gate_key": "gate-1",
+        },
+    )
+    monkeypatch.setattr(app_module.service, "save_gate_detail", lambda gate: gate)
+
+    result = app_module._verify(
+        app_module.VerifyPayload(containers=["CAAU5328959"])
+    )
+
+    assert calls == ["CAAU5328959"]
+    assert result["rows"][0]["cpm_id"] == "200"
+
+
 def test_gate_date_validation_uses_planned_departure_calendar_date():
     today = business_now().strftime("%Y-%m-%d")
 
@@ -108,7 +156,7 @@ def test_left_panel_allocates_remaining_height_to_departure_list():
     markup = (root / "static" / "index.html").read_text(encoding="utf-8")
     styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'styles.css?v=0.14.1' in markup
+    assert 'styles.css?v=0.16.0' in markup
     assert ".input-panel>textarea{height:200px" in styles
     assert ".departure-panel{display:flex;min-height:150px;flex:1 1 auto" in styles
     assert ".departure-list{min-height:70px;max-height:none;flex:1 1 auto" in styles
@@ -120,15 +168,61 @@ def test_empty_install_has_blocking_initial_import_dialog_contract():
     script = (root / "static" / "app.js").read_text(encoding="utf-8")
 
     assert 'id="initial-import-dialog"' in markup
-    assert 'id="initial-import-count"' in markup
-    assert 'min="500" max="1000"' in markup
-    assert 'value="500"' in markup
+    assert 'id="initial-import-count"' not in markup
+    assert "最近 30 天" in markup
+    assert "排除已经出厂" in markup
     assert 'id="initial-import-confirm"' in markup
     assert 'api("/api/initial-import"' in script
-    assert 'app.js?v=0.14.1' in markup
+    assert 'JSON.stringify({confirm:true})' in script
+    assert 'app.js?v=0.16.0' in markup
+    assert "local-first.js" not in markup
+    assert 'api("/api/verify/local"' in script
+    assert 'api("/api/verify/gate"' in script
+    assert "localRow.gate_needs_refresh" not in script
 
 
-def test_initial_import_endpoint_requires_login_and_validates_range(
+def test_result_row_has_confirmed_single_container_photo_refresh_action():
+    root = app_module.BASE_DIR
+    script = (root / "static" / "app.js").read_text(encoding="utf-8")
+    styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'class="photo-refresh-button"' in script
+    assert 'title="重新获取监装照片"' in script
+    assert 'message:"重新下载封箱照片。是否继续？"' in script
+    assert 'api("/api/photos/refresh"' in script
+    assert ".row-actions{display:flex" in styles
+    assert ".photo-refresh-button.checking svg{animation:refresh-spin" in styles
+
+
+def test_photo_refresh_endpoint_returns_rebuilt_row(tmp_path, monkeypatch):
+    database = Database(tmp_path / "smartgpms.sqlite3")
+    database.update_session("logged_in", "operator", "会话有效")
+    monkeypatch.setattr(app_module, "database", database)
+    monkeypatch.setattr(
+        app_module.service,
+        "refresh_container_photos",
+        lambda container: {
+            "record": {"container_no": container},
+            "cpm_id": "101",
+            "downloaded_photo_count": 4,
+            "changed_cpm": True,
+        },
+    )
+    monkeypatch.setattr(
+        app_module,
+        "verify_local",
+        lambda _payload: {"rows": [{"input_container": "MSCU6639870"}]},
+    )
+
+    result = app_module.refresh_photos(
+        app_module.PhotoRefreshPayload(container="MSCU6639870")
+    )
+
+    assert result["row"]["input_container"] == "MSCU6639870"
+    assert result["message"] == "已采用最新监装记录并更新 4 张封箱照片"
+
+
+def test_initial_import_endpoint_requires_login_and_confirmation(
     tmp_path, monkeypatch
 ):
     database = Database(tmp_path / "smartgpms.sqlite3")
@@ -138,19 +232,19 @@ def test_initial_import_endpoint_requires_login_and_validates_range(
     monkeypatch.setattr(app_module.service, "_background_resume_at", 0.0)
 
     with pytest.raises(HTTPException) as logged_out:
-        app_module.configure_initial_import(app_module.InitialImportPayload(count=500))
+        app_module.configure_initial_import(app_module.InitialImportPayload())
     assert logged_out.value.status_code == 401
 
     database.update_session("logged_in", "operator", "会话有效")
     with pytest.raises(HTTPException) as invalid:
-        app_module.configure_initial_import(app_module.InitialImportPayload(count=499))
+        app_module.configure_initial_import(
+            app_module.InitialImportPayload(confirm=False)
+        )
     assert invalid.value.status_code == 400
 
-    result = app_module.configure_initial_import(
-        app_module.InitialImportPayload(count=800)
-    )
+    result = app_module.configure_initial_import(app_module.InitialImportPayload())
     assert result["ok"] is True
-    assert result["target"] == 800
+    assert result["days"] == 30
     assert result["required"] is False
 
 

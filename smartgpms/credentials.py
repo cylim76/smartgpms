@@ -67,16 +67,6 @@ def _windows_unprotect(value: str) -> str:
         ctypes.windll.kernel32.LocalFree(output.pbData)
 
 
-def protect_text(value: str) -> str:
-    """Retain the original Windows DPAPI helper for compatibility."""
-    return _windows_protect(value)
-
-
-def unprotect_text(value: str) -> str:
-    """Retain the original Windows DPAPI helper for compatibility."""
-    return _windows_unprotect(value)
-
-
 class CredentialStore:
     """Encrypt saved credentials using DPAPI on Windows and Fernet on Linux."""
 
@@ -141,25 +131,28 @@ class CredentialStore:
                 self.path.chmod(0o600)
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             username = str(payload.get("username", ""))
-            dpapi_value = str(payload.get("password_dpapi", ""))
-            fernet_value = str(payload.get("password_fernet", ""))
-            if dpapi_value:
-                if self.platform_name != "nt":
-                    return username, ""
+            scheme = str(payload.get("scheme", ""))
+            if self.platform_name == "nt":
+                if scheme != "windows-dpapi":
+                    raise RuntimeError("凭据文件不是 Windows DPAPI 格式")
                 try:
-                    return username, _windows_unprotect(dpapi_value)
+                    return username, _windows_unprotect(
+                        str(payload["password_dpapi"])
+                    )
                 except OSError:
                     # Desktop and Windows-service modes use different DPAPI
                     # identities. Preserve the username but require the current
                     # identity to save its own encrypted password.
                     return username, ""
-            if fernet_value:
-                try:
-                    password = self._fernet().decrypt(fernet_value.encode("ascii"))
-                except (InvalidToken, ValueError) as exc:
-                    raise RuntimeError("无法解密已保存的 smartGPMS 凭据") from exc
-                return username, password.decode("utf-8")
-            return username, ""
+            if scheme != "fernet-v1":
+                raise RuntimeError("凭据文件不是 Linux Fernet 格式")
+            try:
+                password = self._fernet().decrypt(
+                    str(payload["password_fernet"]).encode("ascii")
+                )
+            except (InvalidToken, KeyError, ValueError) as exc:
+                raise RuntimeError("无法解密已保存的 smartGPMS 凭据") from exc
+            return username, password.decode("utf-8")
 
     def public(self) -> dict[str, object]:
         username, password = self.load()

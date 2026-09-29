@@ -4,14 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from smartgpms.credentials import CredentialStore, protect_text, unprotect_text
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows DPAPI test")
-def test_windows_dpapi_round_trip():
-    encrypted = protect_text("smartgpms-test-secret")
-    assert encrypted != "smartgpms-test-secret"
-    assert unprotect_text(encrypted) == "smartgpms-test-secret"
+from smartgpms.credentials import CredentialStore
 
 
 def test_credential_store_round_trip_and_clear(tmp_path):
@@ -47,15 +40,16 @@ def test_linux_credential_store_uses_local_fernet_key(tmp_path):
         assert stat.S_IMODE(store.key_path.stat().st_mode) == 0o600
 
 
-def test_linux_does_not_try_to_decrypt_a_windows_dpapi_file(tmp_path):
+def test_linux_rejects_a_non_fernet_credential_file(tmp_path):
     path = tmp_path / "credentials.json"
     path.write_text(
-        '{"username":"windows.user","password_dpapi":"unreadable"}',
+        '{"username":"windows.user","scheme":"windows-dpapi","password_dpapi":"unreadable"}',
         encoding="utf-8",
     )
     store = CredentialStore(path, platform_name="posix")
 
-    assert store.load() == ("windows.user", "")
+    with pytest.raises(RuntimeError, match="Linux Fernet"):
+        store.load()
 
 
 def test_windows_service_identity_can_ignore_another_dpapi_identity(
@@ -63,7 +57,7 @@ def test_windows_service_identity_can_ignore_another_dpapi_identity(
 ):
     path = tmp_path / "credentials.json"
     path.write_text(
-        '{"username":"desktop.user","password_dpapi":"encrypted"}',
+        '{"username":"desktop.user","scheme":"windows-dpapi","password_dpapi":"encrypted"}',
         encoding="utf-8",
     )
     monkeypatch.setattr(

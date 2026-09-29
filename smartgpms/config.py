@@ -21,10 +21,7 @@ class AppConfig:
     gate_sync_interval_seconds: int = 600
     photo_sync_interval_seconds: int = 1200
     photo_scan_batch_size: int = 20
-    sync_batch_size: int = 100
-    targeted_scan_limit: int = 300
-    startup_snapshot_size: int = 500
-    daily_scan_safety_limit: int = 5000
+    bulk_sync_days: int = 30
     photo_retention_days: int = 30
     crop_retention_days: int = 60
     gatepass_pdf_retention_days: int = 60
@@ -57,3 +54,7 @@ class AppConfig:
     @property
     def gatepass_dir(self) -> Path:
         return self.data_dir / "gatepass"
+
+    @property
+    def sync_export_dir(self) -> Path:
+        return self.data_dir / "sync-exports"

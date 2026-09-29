@@ -205,6 +205,68 @@ def test_process_reuses_ready_original_without_downloading_again(tmp_path):
     assert browser.targets == []
 
 
+def test_forced_refresh_rollback_restores_original_files_and_database(tmp_path):
+    database = Database(tmp_path / "test.sqlite3")
+    database.upsert_cpm(
+        {
+            "cpm_id": "100715",
+            "container_no": "CAAU5328959",
+            "business_stage": 4,
+            "das_process_status": 5,
+        }
+    )
+    cache = tmp_path / "cache"
+    root = cache / "2026" / "09" / "100715_CAAU5328959"
+    root.mkdir(parents=True)
+    original = root / "F000001.jpg"
+    Image.new("RGB", (9, 9), "black").save(original, "JPEG")
+    old_bytes = original.read_bytes()
+    database.save_photo(
+        "100715",
+        {
+            "step_code": "S1",
+            "step_no": 4,
+            "source_url": "http://das/photo/original.jpg",
+            "local_path": str(original),
+            "source_hash": "old-hash",
+            "downloaded_at": "2026-09-24T08:00:00+08:00",
+            "cache_status": "ready",
+        },
+    )
+    pipeline = PhotoPipeline.__new__(PhotoPipeline)
+    pipeline.database = database
+    pipeline.browser = FakeBrowser()
+    pipeline.cache_dir = cache
+    pipeline.evidence_dir = tmp_path / "evidence"
+    pipeline.engine = EmptyEngine()
+
+    context = pipeline.begin_forced_refresh(
+        "100715",
+        {
+            "container_no": "CAAU5328959",
+            "begin_date": "2026-09-24 08:00:00",
+            "business_stage": 4,
+            "photos": [
+                {
+                    "step_no": 4,
+                    "step_code": "S1",
+                    "label": "F000001",
+                    "source_url": "http://das/photo/original.jpg",
+                }
+            ],
+        },
+    )
+    assert original.read_bytes() != old_bytes
+    assert database.photos_for_cpm("100715")[0]["source_hash"] == "hash"
+
+    pipeline.rollback_forced_refresh(context)
+
+    assert original.read_bytes() == old_bytes
+    restored = database.photos_for_cpm("100715")
+    assert len(restored) == 1
+    assert restored[0]["source_hash"] == "old-hash"
+
+
 def test_process_renames_cached_url_filename_to_das_photo_label(tmp_path):
     database = FakeDatabase()
     browser = FakeBrowser()

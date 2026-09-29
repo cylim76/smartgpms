@@ -23,8 +23,7 @@ from .time_utils import business_now
 
 LOGGER = logging.getLogger(__name__)
 ACTIVITY_RETENTION_SECONDS = 2 * 60 * 60
-INITIAL_IMPORT_MIN = 500
-INITIAL_IMPORT_MAX = 1000
+INITIAL_IMPORT_DAYS = 30
 
 
 class ServiceStopping(RuntimeError):
@@ -49,11 +48,13 @@ class SmartGPMSService:
             max_workers=1, thread_name_prefix="smartgpms-ocr"
         )
         self._ocr_job_lock = threading.Lock()
-        self._ocr_job_running = False
+        self._ocr_jobs_inflight: set[int] = set()
+        self._ocr_pipeline_capacity = 2
         self._stop = threading.Event()
         self._drain_requested = threading.Event()
         self._thread: threading.Thread | None = None
         self._task_lock = threading.Lock()
+        self._manual_refresh_lock = threading.Lock()
         self._stop_lock = threading.Lock()
         self._foreground_condition = threading.Condition()
         self._foreground_tasks = 0
@@ -114,30 +115,6 @@ class SmartGPMSService:
         self._stop.clear()
         self._drain_requested.clear()
         self._closed = False
-        removed_legacy = self.database.remove_legacy_import_artifacts()
-        if removed_legacy:
-            self.log_activity(
-                f"独立化迁移完成：已移除旧 das_photo 导入的 {removed_legacy} 个箱号",
-                source="migration",
-            )
-        if not self.database.get_setting("cpm_sync_cursor"):
-            latest = self.database.max_numeric_cpm_id()
-            self.database.set_setting(
-                "cpm_sync_cursor", str((latest + 1) if latest is not None else 2000)
-            )
-        if self.database.get_setting("das_photo_label_filename_migrated") != "1":
-            legacy_ids = self.database.legacy_stage4_filename_ids()
-            queued = sum(
-                int(self.database.enqueue_job("download_ocr", cpm_id))
-                for cpm_id in legacy_ids
-            )
-            self.database.set_setting("das_photo_label_filename_migrated", "1")
-            if legacy_ids:
-                self.log_activity(
-                    f"已安排 {len(legacy_ids)} 个箱号迁移为 DAS F 编号文件名，"
-                    f"新增后台任务 {queued} 个",
-                    source="migration",
-                )
         self._thread = threading.Thread(
             target=self._loop, name="smartgpms-background", daemon=True
         )
@@ -234,14 +211,11 @@ class SmartGPMSService:
             self._startup_sync_pending = not bool(initial_import["required"])
             self._background_resume_at = time.monotonic() + 15
             if initial_import["required"]:
-                message = "登录成功；请确认首次导入数量"
+                message = "登录成功；请确认首次导入最近30天数据"
             elif self.database.get_setting("cpm_initialized") == "1":
                 message = "登录成功；后台巡检将在 07:00–23:59 自动运行"
             else:
-                message = (
-                    "登录成功；将在作业时段初始化最新 "
-                    f"{initial_import['target']} 条监装记录"
-                )
+                message = "登录成功；即将初始化最近30天监装及门证数据"
             self.log_activity(message, source="login")
             return {**result, "initial_import": initial_import}
         except Exception as exc:
@@ -251,68 +225,50 @@ class SmartGPMSService:
 
     def initial_import_state(self) -> dict[str, int | bool]:
         """Describe whether an empty installation still needs user confirmation."""
-        saved = self.database.get_setting("initial_import_target").strip()
-        try:
-            target = int(saved) if saved else self.config.startup_snapshot_size
-        except ValueError:
-            target = self.config.startup_snapshot_size
+        saved = self.database.get_setting("initial_import_confirmed").strip()
         required = self.database.cpm_record_count() == 0 and not saved
         return {
             "required": required,
             "configured": bool(saved),
-            "target": target,
-            "default": self.config.startup_snapshot_size,
-            "minimum": INITIAL_IMPORT_MIN,
-            "maximum": INITIAL_IMPORT_MAX,
+            "days": INITIAL_IMPORT_DAYS,
         }
 
-    def configure_initial_import(self, target: int) -> dict[str, int | bool]:
-        """Persist the one-time import target and release background initialization."""
-        if not INITIAL_IMPORT_MIN <= target <= INITIAL_IMPORT_MAX:
-            raise ValueError(
-                f"初次导入数量必须在 {INITIAL_IMPORT_MIN}–{INITIAL_IMPORT_MAX} 之间"
-            )
+    def configure_initial_import(self, _target: int | None = None) -> dict[str, int | bool]:
+        """Confirm the one-time 30-day import and release initialization."""
         state = self.initial_import_state()
         if not state["required"]:
             return state
-        self.database.set_setting("initial_import_target", str(target))
+        self.database.set_setting("initial_import_confirmed", "1")
         self.database.set_setting("cpm_initialized", "0")
         self._startup_sync_pending = True
         self._background_resume_at = time.monotonic()
         self.log_activity(
-            f"首次导入数量已设置为 {target} 箱，后台初始化即将开始",
+            "已确认首次导入最近30天数据，后台初始化即将开始",
             source="sync",
         )
         return self.initial_import_state()
 
     def sync_latest_window(
         self,
-        limit: int | None = None,
         gate_checkpoint: Callable[[], None] | None = None,
     ) -> dict[str, Any]:
-        """Discover new CPMIDs downward, then maintain only incomplete 30-day rows."""
-        if limit is None:
-            limit = int(self.initial_import_state()["target"])
+        """Synchronize 30 days of exported metadata, then queue changed status-5 rows."""
+        return self._sync_bulk_window(gate_checkpoint=gate_checkpoint)
+
+    def _sync_bulk_window(
+        self, gate_checkpoint: Callable[[], None] | None = None
+    ) -> dict[str, Any]:
         if not self._task_lock.acquire(blocking=False):
             self.log_activity("监装数据同步已在运行，本次请求未重复启动", "warning", "sync")
             return self._sync_result(busy=True)
         try:
-            existing_count = self.database.cpm_record_count()
-            initialized = self.database.get_setting("cpm_initialized") == "1"
-            if not initialized and existing_count >= limit:
-                self.database.set_setting("cpm_initialized", "1")
-                initialized = True
-            initializing = not initialized
-            mode = "首次初始化" if initializing else "日常同步"
-            local_max = self.database.max_numeric_cpm_id()
-            cutoff = (business_now() - timedelta(days=30)).date()
-            self.log_activity(
-                f"{mode}：正在读取 DAS 最新监装记录",
-                source="sync",
+            current = business_now()
+            start = (current - timedelta(days=self.config.bulk_sync_days)).strftime(
+                "%Y%m%d"
             )
-            listing_rows = self._browser_call(self.browser.cpm_snapshot, limit)
-            latest = int(str(listing_rows[0]["cpm_id"]))
-            listed = {str(row["cpm_id"]): row for row in listing_rows}
+            end = current.strftime("%Y%m%d")
+            initializing = self.database.get_setting("cpm_initialized") != "1"
+            mode = "首次初始化" if initializing else "日常同步"
             counters = {
                 "scanned": 0,
                 "new": 0,
@@ -321,134 +277,86 @@ class SmartGPMSService:
                 "downloads": 0,
                 "errors": 0,
             }
-            new_ids: set[str] = set()
-            candidate = latest
-            oldest = str(latest)
-            max_checks = (
-                limit * 3 if initializing else self.config.daily_scan_safety_limit
+
+            gate_rows: list[dict[str, Any]] = []
+            departed_count = 0
+            if initializing:
+                self.log_activity(
+                    f"{mode}：正在下载最近{self.config.bulk_sync_days}天通门证明细",
+                    source="sync",
+                )
+                gate_rows = self._browser_call(
+                    self.browser.gate_pass_export_snapshot, start, end
+                )
+                for row in gate_rows:
+                    record = self._gate_record(row)
+                    if not record["container_no"]:
+                        continue
+                    self.database.upsert_gate_pass(record)
+                    if self._gate_has_departed(record):
+                        departed_count += 1
+
+            self.log_activity(
+                f"{mode}：正在下载最近{self.config.bulk_sync_days}天监装明细",
+                source="sync",
             )
-            checked_ids = 0
-            while checked_ids < max_checks:
+            rows = self._browser_call(
+                self.browser.cpm_export_snapshot, start, end
+            )
+            rows.sort(
+                key=lambda row: (
+                    int(str(row.get("cpm_id", "0")))
+                    if str(row.get("cpm_id", "")).isdigit()
+                    else 0
+                ),
+                reverse=True,
+            )
+            latest = str(rows[0].get("cpm_id", "")) if rows else ""
+            oldest = str(rows[-1].get("cpm_id", "")) if rows else ""
+            for row in rows:
                 if self._drain_requested.is_set():
                     break
-                if initializing and existing_count + len(new_ids) >= limit:
-                    break
-                if not initializing and local_max is not None and candidate <= local_max:
-                    break
-                cpm_id = str(candidate)
-                candidate -= 1
-                checked_ids += 1
-                oldest = cpm_id
-                current = self.database.cpm_by_id(cpm_id)
-                metadata = current or listed.get(cpm_id) or {}
-                known_date = self._business_date(str(metadata.get("begin_date", "")))
-                if not initializing and known_date and known_date < cutoff:
-                    break
-                if initializing and current:
-                    continue
-                try:
-                    detail = self._browser_call(
-                        self.browser.fetch_cpm_detail, cpm_id, False
-                    )
-                except LoginRequired:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - one missing CPMID is expected
-                    LOGGER.warning(
-                        "CPM discovery failed cpm_id=%s: %s", cpm_id, exc
-                    )
+                cpm_id = str(row.get("cpm_id", ""))
+                if not cpm_id or not row.get("container_no"):
                     counters["errors"] += 1
                     continue
-                if not detail.get("container_no"):
-                    continue
-                detail = self._merge_listing_metadata(detail, listed.get(cpm_id) or {})
-                detail_date = self._business_date(str(detail.get("begin_date", "")))
-                if not initializing and detail_date and detail_date < cutoff:
-                    break
+                previous, saved = self.database.upsert_cpm(row)
                 counters["scanned"] += 1
-                previous, saved = self.database.upsert_cpm(
-                    self._sync_record(detail)
-                )
                 if previous is None:
                     counters["new"] += 1
-                    new_ids.add(cpm_id)
                 elif self._status_changed(previous, saved):
                     counters["updated"] += 1
-                if self._schedule_photo_work(cpm_id, detail, saved):
-                    counters["downloads"] += 1
-                self._log_sync_progress(mode, counters)
-                self._photo_scan_checkpoint(counters, gate_checkpoint)
 
-            for current in self.database.numeric_cpm_records_desc():
-                if self._drain_requested.is_set():
-                    break
-                cpm_id = str(current["cpm_id"])
-                if cpm_id in new_ids:
-                    continue
-                business_date = self._business_date(str(current.get("begin_date", "")))
-                if business_date is None or business_date < cutoff:
-                    continue
-                counters["scanned"] += 1
-                intentionally_cleaned = self.database.stage4_cache_was_cleaned(cpm_id)
-                completed = int(current.get("das_process_status", 0)) >= 5
-                files_complete = self._archive_files_complete(cpm_id)
-                if completed and (files_complete or intentionally_cleaned):
-                    if files_complete and current.get("ocr_status") not in {
-                        "ready",
-                        "review",
-                        "cleaned",
-                    }:
-                        counters["downloads"] += int(
-                            self.database.enqueue_job("download_ocr", cpm_id)
-                        )
+                complete = int(saved.get("das_process_status", 0)) >= 5
+                departed = complete and self._cpm_has_departed(saved)
+                if departed:
+                    self.database.cancel_photo_job(cpm_id, "该箱已实际出厂，跳过自动下载")
                     counters["skipped"] += 1
-                    self._log_sync_progress(mode, counters)
-                    self._photo_scan_checkpoint(counters, gate_checkpoint)
-                    continue
-                if completed:
-                    counters["downloads"] += int(
-                        self.database.enqueue_job("download_ocr", cpm_id)
-                    )
-                    self._log_sync_progress(mode, counters)
-                    self._photo_scan_checkpoint(counters, gate_checkpoint)
-                    continue
-                try:
-                    detail = self._browser_call(
-                        self.browser.fetch_cpm_detail, cpm_id, False
-                    )
-                except LoginRequired:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - keep maintaining other boxes
-                    LOGGER.warning(
-                        "CPM maintenance failed cpm_id=%s: %s", cpm_id, exc
-                    )
-                    counters["errors"] += 1
-                    continue
-                if not detail.get("container_no"):
-                    continue
-                detail = self._merge_listing_metadata(detail, current)
-                previous, saved = self.database.upsert_cpm(
-                    self._sync_record(detail)
-                )
-                if previous and self._status_changed(previous, saved):
-                    counters["updated"] += 1
-                if self._schedule_photo_work(cpm_id, detail, saved):
+                elif complete and self._schedule_photo_work(cpm_id, row, saved):
                     counters["downloads"] += 1
+                else:
+                    counters["skipped"] += 1
                 self._log_sync_progress(mode, counters)
                 self._photo_scan_checkpoint(counters, gate_checkpoint)
 
-            if initializing and self.database.cpm_record_count() >= limit:
+            completed = not self._drain_requested.is_set()
+            if completed:
                 self.database.set_setting("cpm_initialized", "1")
-            self.database.set_setting("latest_cpm_id", str(latest))
-            self.database.set_setting("snapshot_oldest_cpm_id", oldest)
-            self.database.set_setting("cpm_sync_cursor", str(latest + 1))
+            self.database.set_setting("latest_cpm_id", latest)
+            self.database.set_setting("bulk_sync_start_date", start)
+            self.database.set_setting("bulk_sync_completed_at", now_text())
             self.log_activity(
-                f"{mode}完成：{self._sync_summary(counters)}",
+                f"{mode}{'完成' if completed else '已安全暂停'}："
+                f"{self._sync_summary(counters)} / "
+                f"门证明细 {len(gate_rows)} 箱 / 已出厂 {departed_count} 箱",
                 source="sync",
             )
             return self._sync_result(
                 **counters,
-                latest_cpm_id=str(latest),
+                latest_cpm_id=latest,
                 oldest_cpm_id=oldest,
+                gate_rows=len(gate_rows),
+                departed=departed_count,
             )
         except LoginRequired:
             self.database.update_session("logged_out", message="DAS 会话已失效")
@@ -460,11 +368,28 @@ class SmartGPMSService:
         finally:
             self._task_lock.release()
 
+    def _cpm_has_departed(self, record: dict[str, Any]) -> bool:
+        """Match departure by container and chronology; seal is only informational."""
+        begin = self._parsed_gate_datetime(str(record.get("begin_date", "")))
+        for gate in self.database.gate_passes_for_container(
+            str(record.get("container_no", ""))
+        ):
+            if not self._gate_has_departed(gate):
+                continue
+            actual = self._parsed_gate_datetime(
+                str(gate.get("actual_departure_at", ""))
+            )
+            if actual is not None and (begin is None or actual >= begin):
+                return True
+        return False
+
     @staticmethod
     def _sync_record(detail: dict[str, Any]) -> dict[str, Any]:
         return {
             **detail,
-            "das_status_text": detail.get("status_text", ""),
+            "das_status_text": detail.get(
+                "status_text", detail.get("das_status_text", "")
+            ),
             "photo_count": SmartGPMSService._stage4_photo_count(detail),
             "archive_status": int(detail.get("business_stage", 0)),
             "is_valid": True,
@@ -482,7 +407,20 @@ class SmartGPMSService:
         detail: dict[str, Any], metadata: dict[str, Any]
     ) -> dict[str, Any]:
         merged = dict(detail)
-        for name in ("begin_date", "end_date", "product_type", "packing_type"):
+        for name in (
+            "begin_date",
+            "end_date",
+            "product_type",
+            "packing_type",
+            "upload_quantity",
+            "seal_no",
+            "stage1_confirmed_at",
+            "stage2_confirmed_at",
+            "stage3_confirmed_at",
+            "stage4_confirmed_at",
+            "service_year",
+            "inspection_result",
+        ):
             merged[name] = merged.get(name) or metadata.get(name, "")
         return merged
 
@@ -494,11 +432,10 @@ class SmartGPMSService:
     def _schedule_photo_work(
         self, cpm_id: str, detail: dict[str, Any], record: dict[str, Any]
     ) -> bool:
-        has_stage4 = any(
-            int(photo.get("step_no", 0)) == 4 for photo in detail.get("photos", [])
-        )
+        if not int(record.get("is_valid", 1)):
+            return False
         process_complete = int(detail.get("das_process_status", 0)) >= 5
-        if not process_complete and not has_stage4:
+        if not process_complete:
             return False
         if self.database.stage4_cache_was_cleaned(cpm_id):
             return False
@@ -657,15 +594,20 @@ class SmartGPMSService:
                 record = self._gate_record(row)
                 if not record["container_no"]:
                     continue
+                previous, saved = self.database.upsert_gate_pass(record)
                 if self._gate_has_departed(record):
                     self.database.mark_gate_departed(
                         str(record["gate_key"]),
                         str(record.get("actual_departure_at", "")),
                     )
+                    cpm = self.database.latest_valid_cpm(str(record["container_no"]))
+                    if cpm and self._cpm_has_departed(cpm):
+                        self.database.cancel_photo_job(
+                            str(cpm["cpm_id"]), "该箱已实际出厂，跳过自动下载"
+                        )
                     departed += 1
                     continue
                 scanned += 1
-                previous, saved = self.database.upsert_gate_pass(record)
                 changed = bool(
                     previous
                     and previous.get("source_fingerprint")
@@ -859,6 +801,8 @@ class SmartGPMSService:
         errors: int = 0,
         latest_cpm_id: str = "",
         oldest_cpm_id: str = "",
+        gate_rows: int = 0,
+        departed: int = 0,
         busy: bool = False,
     ) -> dict[str, Any]:
         return {
@@ -873,166 +817,10 @@ class SmartGPMSService:
             "queued": downloads,
             "latest_cpm_id": latest_cpm_id,
             "oldest_cpm_id": oldest_cpm_id,
+            "gate_rows": gate_rows,
+            "departed": departed,
             "busy": busy,
         }
-
-    def _sync_latest_window_obsolete(
-        self, limit: int | None = None
-    ) -> dict[str, Any]:
-        """Initialize 500 CPM records, then maintain the latest 500-record window."""
-        limit = limit or self.config.startup_snapshot_size
-        if not self._task_lock.acquire(blocking=False):
-            self.log_activity("监装数据同步已在运行，本次请求未重复启动", "warning", "sync")
-            return {"checked": 0, "found": 0, "queued": 0, "errors": 0, "busy": True}
-        try:
-            existing_count = self.database.cpm_record_count()
-            initialized = self.database.get_setting("cpm_initialized") == "1"
-            if not initialized and existing_count >= limit:
-                self.database.set_setting("cpm_initialized", "1")
-                initialized = True
-            initializing = not initialized
-            mode = "首次初始化" if initializing else "日常巡检"
-            self.log_activity(
-                f"{mode}：正在打开 DAS 照片列表获取最新监装记录", source="sync"
-            )
-            listing_rows = self._browser_call(self.browser.cpm_snapshot, limit)
-            latest = int(str(listing_rows[0]["cpm_id"]))
-            listed = {str(row["cpm_id"]): row for row in listing_rows}
-            checked = found = new_records = queued = errors = 0
-            candidate = latest
-            oldest = str(latest)
-            max_checks = (
-                limit * 3 if initializing else self.config.daily_scan_safety_limit
-            )
-            cutoff = (business_now() - timedelta(days=30)).date()
-            while checked < max_checks:
-                if initializing and found >= limit:
-                    break
-                cpm_id = str(candidate)
-                candidate -= 1
-                checked += 1
-                oldest = cpm_id
-                current = self.database.cpm_by_id(cpm_id)
-                known_date = self._business_date(
-                    str((current or listed.get(cpm_id) or {}).get("begin_date", ""))
-                )
-                if not initializing and known_date and known_date < cutoff:
-                    self.log_activity(
-                        f"日常巡检到达30天边界：开始日期 {known_date}",
-                        source="sync",
-                    )
-                    break
-                if (
-                    not initializing
-                    and current
-                    and int(current.get("archive_status", 0)) == 5
-                    and self._archive_files_complete(cpm_id)
-                ):
-                    found += 1
-                    continue
-                if current and int(current.get("archive_status", 0)) == 5:
-                    self.database.mark_archive_status(
-                        cpm_id, int(current.get("business_stage", 0))
-                    )
-                    self.log_activity(
-                        "发现已完成记录的本地照片缺失，已安排修复", "warning", "sync"
-                    )
-                try:
-                    detail = self._browser_call(
-                        self.browser.fetch_cpm_detail, cpm_id, False
-                    )
-                except LoginRequired:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - skip one malformed/missing CPM record
-                    LOGGER.warning(
-                        "CPM metadata fetch failed cpm_id=%s: %s", cpm_id, exc
-                    )
-                    errors += 1
-                    continue
-                if not detail.get("container_no"):
-                    continue
-                list_metadata = listed.get(cpm_id) or {}
-                detail["begin_date"] = detail.get("begin_date") or list_metadata.get(
-                    "begin_date", ""
-                )
-                detail["end_date"] = detail.get("end_date") or list_metadata.get(
-                    "end_date", ""
-                )
-                detail["product_type"] = detail.get(
-                    "product_type"
-                ) or list_metadata.get("product_type", "")
-                detail["packing_type"] = detail.get(
-                    "packing_type"
-                ) or list_metadata.get("packing_type", "")
-                detail_date = self._business_date(str(detail.get("begin_date", "")))
-                if not initializing and detail_date and detail_date < cutoff:
-                    self.log_activity(
-                        f"日常巡检到达30天边界：开始日期 {detail_date}",
-                        source="sync",
-                    )
-                    break
-                found += 1
-                previous, current = self.database.upsert_cpm(
-                    {
-                        **detail,
-                        "das_status_text": detail.get("status_text", ""),
-                        "photo_count": self._stage4_photo_count(detail),
-                        "archive_status": int(detail.get("business_stage", 0)),
-                        "is_valid": True,
-                    }
-                )
-                new_records += int(previous is None)
-                has_stage4 = any(
-                    int(photo.get("step_no", 0)) == 4
-                    for photo in detail.get("photos", [])
-                )
-                process_complete = int(detail.get("das_process_status", 0)) == 5
-                if process_complete or has_stage4:
-                    if self._archive_files_complete(cpm_id):
-                        self.database.mark_archive_status(cpm_id, 5)
-                    elif self.database.stage4_cache_was_cleaned(cpm_id):
-                        self.log_activity(
-                            "该监装记录的照片已按保留策略清理，仅在人工核验时重新下载",
-                            source="cleanup",
-                        )
-                    else:
-                        queued += int(
-                            self.database.enqueue_job("download_ocr", cpm_id)
-                        )
-                if checked % 25 == 0:
-                    self.log_activity(
-                        f"{mode}已检查 {checked} 箱，有效 {found} 箱，新增 {new_records} 箱，照片排队 {queued} 箱",
-                        source="sync",
-                    )
-            latest_text = str(latest)
-            self.database.cancel_pending_jobs_before(oldest)
-            queued += self._queue_ocr_backlog(oldest)
-            if initializing and found >= limit:
-                self.database.set_setting("cpm_initialized", "1")
-            self.database.set_setting("latest_cpm_id", latest_text)
-            self.database.set_setting("snapshot_oldest_cpm_id", oldest)
-            self.database.set_setting("cpm_sync_cursor", str(latest + 1))
-            self.log_activity(
-                f"{mode}完成：{latest_text} 至 {oldest}，检查 {checked}，有效 {found}，待归档照片排队 {queued}",
-                source="sync",
-            )
-            return {
-                "checked": checked,
-                "found": found,
-                "queued": queued,
-                "errors": errors,
-                "latest_cpm_id": latest_text,
-                "oldest_cpm_id": oldest,
-            }
-        except LoginRequired:
-            self.database.update_session("logged_out", message="DAS 会话已失效")
-            self.log_activity("监装数据同步停止：DAS 会话已失效", "error", "sync")
-            raise
-        except Exception as exc:
-            self.log_activity(f"监装数据同步失败：{exc}", "error", "sync")
-            raise
-        finally:
-            self._task_lock.release()
 
     def _archive_files_complete(self, cpm_id: str) -> bool:
         photos = [
@@ -1088,122 +876,17 @@ class SmartGPMSService:
         )
         return result
 
-    def sync_cpm(self, cpm_ids: list[str] | None = None) -> dict[str, int]:
-        if not self._task_lock.acquire(blocking=False):
-            return {"checked": 0, "found": 0, "queued": 0, "errors": 0}
-        try:
-            next_cursor: str | None = None
-            if cpm_ids is None:
-                ids, next_cursor = self._sync_candidates()
-            else:
-                ids = cpm_ids
-            checked = found = queued = errors = 0
-            session_lost = False
-            try:
-                self._browser_call(self.browser.refresh_das)
-            except LoginRequired:
-                self.database.update_session("logged_out", message="DAS 会话已失效")
-                return {"checked": 0, "found": 0, "queued": 0, "errors": 1}
-            for cpm_id in ids:
-                if self._drain_requested.is_set():
-                    break
-                checked += 1
-                try:
-                    detail = self._browser_call(
-                        self.browser.fetch_cpm_detail, cpm_id, False
-                    )
-                except LoginRequired:
-                    self.database.update_session("logged_out", message="DAS 会话已失效")
-                    session_lost = True
-                    break
-                except Exception:
-                    LOGGER.exception("CPM metadata sync failed cpm_id=%s", cpm_id)
-                    errors += 1
-                    break
-                if not detail.get("container_no"):
-                    continue
-                found += 1
-                previous, current = self.database.upsert_cpm(
-                    {
-                        **detail,
-                        "das_status_text": detail.get("status_text", ""),
-                        "photo_count": self._stage4_photo_count(detail),
-                        "is_valid": True,
-                    }
-                )
-                transitioned = int(current.get("das_process_status", 0)) == 5 and (
-                    not previous or int(previous.get("das_process_status", 0)) < 5
-                )
-                recent_unprinted = (
-                    int(current.get("das_process_status", 0)) == 5
-                    and not int(current.get("print_status", 0))
-                    and self._is_recent(current)
-                )
-                eligible_for_ocr = (
-                    int(current.get("das_process_status", 0)) == 5
-                    or int(current.get("business_stage", 0)) == 4
-                ) and current.get("ocr_status") not in {"ready", "review", "cleaned"}
-                if transitioned or recent_unprinted or eligible_for_ocr:
-                    queued += int(self.database.enqueue_job("download_ocr", cpm_id))
-            queued += self._queue_ocr_backlog(
-                self.database.get_setting("snapshot_oldest_cpm_id") or None
-            )
-            if next_cursor and not session_lost and errors == 0:
-                self.database.set_setting("cpm_sync_cursor", next_cursor)
-            return {
-                "checked": checked,
-                "found": found,
-                "queued": queued,
-                "errors": errors,
-            }
-        finally:
-            self._task_lock.release()
-
-    def _sync_candidates(self) -> tuple[list[str], str]:
-        cursor = int(self.database.get_setting("cpm_sync_cursor", "2000") or 2000)
-        new_ids = [
-            str(value) for value in range(cursor, cursor + self.config.sync_batch_size)
-        ]
-        recent = self.database.recent_cpm_ids(100)
-        return list(dict.fromkeys(recent + new_ids)), str(
-            cursor + self.config.sync_batch_size
-        )
-
-    def _queue_ocr_backlog(self, oldest_cpm_id: str | None = None) -> int:
-        if self._drain_requested.is_set():
-            return 0
-        queued = 0
-        for cpm_id in self.database.ocr_backlog_ids(
-            oldest_cpm_id, self.config.startup_snapshot_size
-        ):
-            queued += int(self.database.enqueue_job("download_ocr", cpm_id))
-        if queued:
-            self.log_activity(
-                f"已安排 {queued} 个箱号在后台空闲时预先下载、裁剪并 OCR",
-                source="ocr",
-            )
-        return queued
-
-    @staticmethod
-    def _is_recent(record: dict[str, Any]) -> bool:
-        text = str(record.get("end_date") or record.get("begin_date") or "")
-        current = business_now()
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
-            try:
-                parsed = datetime.strptime(text[:19], fmt).replace(
-                    tzinfo=current.tzinfo
-                )
-                return current - parsed <= timedelta(hours=24)
-            except ValueError:
-                continue
-        return False
-
     def _finish_background_job(
         self,
         job: dict[str, Any],
         status: str,
         error: str = "",
     ) -> None:
+        if job.get("job_type") == "download_ocr":
+            record = self.database.cpm_by_id(str(job["cpm_id"]))
+            if record is not None and not int(record.get("is_valid", 1)):
+                status = "cancelled"
+                error = "该监装记录已被新的记录替代"
         run_after = now_text()
         attempts = int(job.get("attempts", 0)) + 1
         if status == "pending":
@@ -1247,21 +930,25 @@ class SmartGPMSService:
             self._finish_background_job(job, status, str(exc))
         finally:
             with self._ocr_job_lock:
-                self._ocr_job_running = False
+                self._ocr_jobs_inflight.discard(int(job["id"]))
 
     def run_one_job(self) -> bool:
         if self._drain_requested.is_set():
             return False
         with self._ocr_job_lock:
-            ocr_busy = self._ocr_job_running
+            photo_capacity_available = (
+                len(self._ocr_jobs_inflight) < self._ocr_pipeline_capacity
+            )
         with self.database.transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM background_jobs WHERE status='pending' AND run_after<=? "
                 "AND (?=0 OR job_type='gate_pdf') "
+                "AND (job_type='gate_pdf' OR NOT EXISTS ("
+                "SELECT 1 FROM cpm_records c WHERE c.cpm_id=background_jobs.cpm_id AND c.is_valid=0)) "
                 "ORDER BY CASE WHEN job_type='gate_pdf' THEN 0 ELSE 1 END, "
                 "CASE WHEN cpm_id GLOB '[0-9]*' THEN CAST(cpm_id AS INTEGER) ELSE 0 END DESC, "
                 "id DESC LIMIT 1",
-                (now_text(), int(ocr_busy)),
+                (now_text(), int(not photo_capacity_available)),
             ).fetchone()
             if not row:
                 return False
@@ -1273,7 +960,7 @@ class SmartGPMSService:
         is_photo_job = job["job_type"] != "gate_pdf"
         if is_photo_job:
             with self._ocr_job_lock:
-                self._ocr_job_running = True
+                self._ocr_jobs_inflight.add(int(job["id"]))
         try:
             completed_status = "done"
             if job["job_type"] == "gate_pdf":
@@ -1307,6 +994,17 @@ class SmartGPMSService:
                     )
                 self._finish_background_job(job, completed_status)
             else:
+                cpm = self.database.cpm_by_id(str(job["cpm_id"]))
+                if cpm and self._cpm_has_departed(cpm):
+                    self.log_activity(
+                        f"{cpm['container_no']}：已实际出厂，跳过监装照片自动下载",
+                        source="ocr",
+                        container_no=str(cpm["container_no"]),
+                    )
+                    self._finish_background_job(job, "cancelled")
+                    with self._ocr_job_lock:
+                        self._ocr_jobs_inflight.discard(int(job["id"]))
+                    return True
                 self.log_activity("后台正在下载监装照片", source="ocr")
                 detail = self._browser_call(
                     self.browser.fetch_cpm_detail, job["cpm_id"]
@@ -1352,7 +1050,7 @@ class SmartGPMSService:
             self._finish_background_job(job, status, error)
             if is_photo_job:
                 with self._ocr_job_lock:
-                    self._ocr_job_running = False
+                    self._ocr_jobs_inflight.discard(int(job["id"]))
         return True
 
     def prepare_container(self, container_no: str) -> dict[str, Any] | None:
@@ -1413,48 +1111,146 @@ class SmartGPMSService:
         )
         return self.database.verification_row(container_no)
 
-    def resolve_container(self, container_no: str) -> dict[str, Any]:
-        """Resolve a missing container through the DAS photo-download search page."""
+    def refresh_container_photos(self, container_no: str) -> dict[str, Any]:
+        """Force a safe one-container refresh while keeping the old cache on failure."""
+        if not self._manual_refresh_lock.acquire(blocking=False):
+            raise RuntimeError("已有照片更新任务正在执行，请稍候")
         wanted = container_no.strip().upper()
+        previous_active = self.database.latest_valid_cpm(wanted)
+        previous_valid_ids = set(self.database.valid_cpm_ids(wanted))
+        selected: dict[str, Any] | None = None
+        context: dict[str, Any] | None = None
+        reservation = "available"
+        self.note_interactive()
         self.log_activity(
-            f"{wanted}：本地无记录，正在查询 DAS 照片页面",
+            f"{wanted}：正在查询最新监装照片记录",
             source="verify",
             container_no=wanted,
             stage="photo_query",
         )
-        record = self.database.latest_valid_cpm(wanted)
-        if record:
+        try:
+            resolved = self.resolve_container(wanted)
+            selected = resolved.get("record")
+            detail = resolved.get("detail")
+            if not selected or not detail:
+                raise RuntimeError(
+                    str(resolved.get("message") or "未找到该箱号的监装照片记录")
+                )
+            cpm_id = str(selected["cpm_id"])
+            reservation = self.database.reserve_manual_photo_refresh(cpm_id)
+            if reservation == "running":
+                raise RuntimeError("该箱照片正在后台处理中，请稍候再更新")
+            context = self._browser_call(
+                self.photos.begin_forced_refresh,
+                cpm_id,
+                detail,
+                lambda stage, label: self.log_activity(
+                    f"{wanted}：{label}",
+                    source="verify",
+                    container_no=wanted,
+                    stage=stage,
+                ),
+            )
+            self._ocr_call(
+                self.photos.recognize,
+                cpm_id,
+                detail,
+                lambda stage, label: self.log_activity(
+                    f"{wanted}：{label}",
+                    source="verify",
+                    container_no=wanted,
+                    stage=stage,
+                ),
+            )
+            self.photos.commit_forced_refresh(context)
+            refreshed = self.database.verification_row(wanted)
+            count = int(context.get("downloaded_photo_count", 0))
+            self.log_activity(
+                f"{wanted}：监装照片已更新，共 {count} 张",
+                source="verify",
+                container_no=wanted,
+                stage="ocr_done",
+            )
             return {
-                "record": record,
-                "gate": None,
-                "gate_status": "unknown",
-                "checked": 0,
+                "record": refreshed or selected,
+                "cpm_id": cpm_id,
+                "downloaded_photo_count": count,
+                "changed_cpm": bool(
+                    previous_active
+                    and str(previous_active["cpm_id"]) != cpm_id
+                ),
             }
+        except Exception:
+            if context is not None:
+                self.photos.rollback_forced_refresh(context)
+            if previous_active is not None:
+                self.database.set_cpm_validity(
+                    str(previous_active["cpm_id"]), True
+                )
+            if (
+                selected is not None
+                and str(selected["cpm_id"]) not in previous_valid_ids
+            ):
+                self.database.set_cpm_validity(str(selected["cpm_id"]), False)
+            if reservation == "cancelled" and selected is not None:
+                self.database.enqueue_job("download_ocr", str(selected["cpm_id"]))
+            self.log_activity(
+                f"{wanted}：照片更新失败，已保留原照片",
+                "error",
+                "verify",
+                container_no=wanted,
+                stage="photo_query",
+            )
+            raise
+        finally:
+            self._manual_refresh_lock.release()
+
+    def resolve_container(self, container_no: str) -> dict[str, Any]:
+        """Refresh a container mapping through the DAS photo-download search page."""
+        wanted = container_no.strip().upper()
+        self.log_activity(
+            f"{wanted}：正在确认最新监装记录",
+            source="verify",
+            container_no=wanted,
+            stage="photo_query",
+        )
+        local_record = self.database.latest_valid_cpm(wanted)
         try:
             candidates = self._browser_call(
                 self.browser.find_cpm_by_container, wanted
             )
         except LoginRequired:
             raise
-        except Exception as exc:
+        except Exception:
             LOGGER.exception("Photo-page CPM lookup failed container=%s", wanted)
             return {
-                "record": None,
+                "record": local_record,
                 "gate": None,
                 "gate_status": "unknown",
                 "checked": 0,
-                "message": f"DAS 照片页面查询失败：{exc}",
+                "message": "监装记录暂时无法刷新，已使用本地数据",
             }
         if not candidates:
             return {
-                "record": None,
+                "record": local_record,
                 "gate": None,
                 "gate_status": "unknown",
                 "checked": 0,
-                "message": "DAS 照片页面未找到对应箱号记录",
+                "message": (
+                    "未找到该箱号的监装照片记录"
+                    if local_record is None
+                    else "监装记录暂时无法刷新，已使用本地数据"
+                ),
             }
 
-        resolved: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+        visible_ids = {
+            str(metadata.get("cpm_id", ""))
+            for metadata in candidates
+            if str(metadata.get("cpm_id", ""))
+        }
+        resolved: list[
+            tuple[tuple[int, int], dict[str, Any], dict[str, Any]]
+        ] = []
         for metadata in candidates:
             cpm_id = str(metadata.get("cpm_id", ""))
             if not cpm_id:
@@ -1479,27 +1275,46 @@ class SmartGPMSService:
                 self._sync_record(detail)
             )
             stage4_count = self._stage4_photo_count(detail)
-            process_complete = int(detail.get("das_process_status", 0)) >= 5
+            has_stage4 = bool(
+                stage4_count
+                or int(current.get("downloaded_photo_count", 0))
+                or int(current.get("photo_count", 0))
+            )
             numeric_id = int(cpm_id) if cpm_id.isdigit() else 0
             resolved.append(
                 (
                     (
-                        int(stage4_count > 0),
-                        int(process_complete),
+                        int(has_stage4),
                         numeric_id,
                     ),
                     current,
+                    detail,
                 )
             )
         if not resolved:
             return {
-                "record": None,
+                "record": local_record,
                 "gate": None,
                 "gate_status": "unknown",
                 "checked": len(candidates),
-                "message": "已找到监装记录，但照片详情读取失败，请稍后重试",
+                "message": (
+                    "监装照片详情读取失败，请稍后重试"
+                    if local_record is None
+                    else "监装记录暂时无法刷新，已使用本地数据"
+                ),
             }
-        _rank, selected = max(resolved, key=lambda item: item[0])
+        _rank, selected, selected_detail = max(resolved, key=lambda item: item[0])
+        superseded = self.database.supersede_missing_cpm_records(
+            wanted,
+            str(selected["cpm_id"]),
+            visible_ids,
+        )
+        if superseded:
+            self.log_activity(
+                f"{wanted}：已采用新的监装记录，旧记录停止后台处理",
+                source="sync",
+                container_no=wanted,
+            )
         self.log_activity(
             f"{wanted}：已找到监装照片记录",
             source="verify",
@@ -1508,6 +1323,7 @@ class SmartGPMSService:
         )
         return {
             "record": selected,
+            "detail": selected_detail,
             "gate": None,
             "gate_status": "unknown",
             "checked": len(candidates),
@@ -1607,9 +1423,14 @@ class SmartGPMSService:
                         ),
                         source="schedule",
                     )
-                if not window_open:
-                    continue
                 startup_sync = self._startup_sync_pending
+                initialization_exception = (
+                    startup_sync
+                    and not self.initial_import_state()["required"]
+                    and self.database.get_setting("cpm_initialized") != "1"
+                )
+                if not window_open and not initialization_exception:
+                    continue
                 self._startup_sync_pending = False
                 if startup_sync or now >= next_gate_sync:
                     try:
