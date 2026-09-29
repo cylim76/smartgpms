@@ -1,5 +1,9 @@
 # smartGPMS 实施状态
 
+## 2026-09-29 Windows 服务入口修复（0.17.2）
+
+- 修复 WinSW 直接执行 `tools/run_service.py` 时项目根目录不在 Python 模块搜索路径、导致更新后服务可能立即退出的问题；直接脚本与 Linux 模块入口现在使用同一导入路径。
+
 ## 2026-09-29 Windows 一键服务更新（0.17.1）
 
 - 项目根目录新增 `update.bat`：自动申请管理员权限，等待 smartGPMS 服务停止，执行 `git pull --ff-only`，随后启动服务并等待进入运行状态。

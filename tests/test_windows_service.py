@@ -114,6 +114,22 @@ def test_windows_service_runner_forces_single_server_mode(monkeypatch):
     }
 
 
+def test_direct_windows_service_script_adds_project_root_to_import_path(
+    tmp_path, monkeypatch
+):
+    from tools import run_service
+
+    monkeypatch.setattr(run_service.sys, "path", [str(tmp_path / "tools")])
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "smartgpms"
+    project.mkdir()
+
+    run_service.prepare_project_import_path(project)
+
+    assert run_service.sys.path[0] == str(project)
+    assert Path.cwd() == project
+
+
 def test_service_runner_returns_controlled_restart_code(monkeypatch):
     from tools import run_service
 

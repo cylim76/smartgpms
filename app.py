@@ -64,7 +64,7 @@ async def lifespan(_: FastAPI):
     service.stop()
 
 
-app = FastAPI(title="smartGPMS", version="0.17.1", lifespan=lifespan)
+app = FastAPI(title="smartGPMS", version="0.17.2", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
