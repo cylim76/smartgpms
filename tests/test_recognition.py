@@ -61,3 +61,60 @@ def test_complete_vertical_container_crop_is_tight_and_saved_horizontally(tmp_pa
     with Image.open(target) as crop:
         assert crop.width > crop.height
         assert crop.width < image.width / 2
+
+
+def test_save_crop_applies_final_human_orientation_normalizer(tmp_path):
+    image = Image.new("RGB", (120, 60), "red")
+    for y in range(30, 60):
+        for x in range(120):
+            image.putpixel((x, y), (0, 0, 255))
+    items = [
+        OCRItem(
+            text="A566320",
+            score=0.99,
+            box=[[18, 18], [102, 18], [102, 42], [18, 42]],
+        )
+    ]
+    target = tmp_path / "upright.jpg"
+
+    save_crop(
+        image,
+        items,
+        [0],
+        target,
+        target_type="seal",
+        orientation_normalizer=lambda crop: crop.transpose(
+            Image.Transpose.ROTATE_180
+        ),
+    )
+
+    with Image.open(target) as crop:
+        top = crop.getpixel((crop.width // 2, 2))
+        bottom = crop.getpixel((crop.width // 2, crop.height - 3))
+        assert top[2] > top[0]
+        assert bottom[0] > bottom[2]
+
+
+def test_rapidocr_orientation_classifier_rotates_only_confident_180():
+    class FakeResult:
+        cls_res = [("180", 0.97)]
+
+    class FakeEngine:
+        def __call__(self, image, **kwargs):
+            assert isinstance(image, Image.Image)
+            assert kwargs == {"use_det": False, "use_cls": True, "use_rec": False}
+            return FakeResult()
+
+    from smartgpms.recognition import RapidOCREngine
+
+    engine = RapidOCREngine()
+    engine._engine = FakeEngine()
+    image = Image.new("RGB", (20, 10), "red")
+    for y in range(5, 10):
+        for x in range(20):
+            image.putpixel((x, y), (0, 0, 255))
+
+    normalized = engine.normalize_text_orientation(image)
+
+    assert normalized.getpixel((10, 1)) == (0, 0, 255)
+    assert normalized.getpixel((10, 8)) == (255, 0, 0)

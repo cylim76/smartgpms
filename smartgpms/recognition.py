@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image, ImageDraw
 
@@ -36,6 +36,10 @@ class RapidOCREngine:
     def __init__(self) -> None:
         self._engine: Any | None = None
         self._lock = threading.Lock()
+        # RapidOCR updates its active pipeline flags on every call. Serialise
+        # full OCR and orientation-only calls so one cannot change the other
+        # while an inference is in progress.
+        self._inference_lock = threading.Lock()
 
     def _get_engine(self):
         if self._engine is None:
@@ -47,7 +51,10 @@ class RapidOCREngine:
         return self._engine
 
     def recognize(self, image_path: Path) -> list[OCRItem]:
-        result = self._get_engine()(str(image_path))
+        with self._inference_lock:
+            result = self._get_engine()(
+                str(image_path), use_det=True, use_cls=True, use_rec=True
+            )
         if result is None:
             return []
         raw_boxes = getattr(result, "boxes", None)
@@ -65,6 +72,28 @@ class RapidOCREngine:
             for index, text in enumerate(texts)
             if index < len(boxes)
         ]
+
+    def normalize_text_orientation(
+        self, image: Image.Image, minimum_confidence: float = 0.90
+    ) -> Image.Image:
+        """Rotate an already-horizontal text crop upright for human viewing.
+
+        RapidOCR applies the same 0/180 classifier internally before text
+        recognition, but that correction is not reflected in its source boxes.
+        Reusing the classifier here keeps the displayed crop consistent with
+        the orientation that the recognizer actually read.
+        """
+        with self._inference_lock:
+            result = self._get_engine()(
+                image, use_det=False, use_cls=True, use_rec=False
+            )
+        classifications = getattr(result, "cls_res", None) or []
+        if not classifications:
+            return image
+        label, confidence = classifications[0]
+        if str(label) == "180" and float(confidence) >= minimum_confidence:
+            return image.transpose(Image.Transpose.ROTATE_180)
+        return image
 
 
 def _coerce_container(raw: str) -> tuple[str, int] | None:
@@ -258,6 +287,7 @@ def save_crop(
     target_type: str = "",
     complete: bool = False,
     source_rotation: int = 0,
+    orientation_normalizer: Callable[[Image.Image], Image.Image] | None = None,
 ) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target_type == "container" and not complete:
@@ -298,6 +328,8 @@ def save_crop(
             else Image.Transpose.ROTATE_90
         )
         crop = crop.transpose(transpose)
+    if orientation_normalizer is not None:
+        crop = orientation_normalizer(crop)
     crop.save(target, format="JPEG", quality=94)
 
 

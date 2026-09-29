@@ -156,7 +156,7 @@ def test_left_panel_allocates_remaining_height_to_departure_list():
     markup = (root / "static" / "index.html").read_text(encoding="utf-8")
     styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'styles.css?v=0.16.0' in markup
+    assert 'styles.css?v=0.16.1' in markup
     assert ".input-panel>textarea{height:200px" in styles
     assert ".departure-panel{display:flex;min-height:150px;flex:1 1 auto" in styles
     assert ".departure-list{min-height:70px;max-height:none;flex:1 1 auto" in styles
@@ -174,7 +174,7 @@ def test_empty_install_has_blocking_initial_import_dialog_contract():
     assert 'id="initial-import-confirm"' in markup
     assert 'api("/api/initial-import"' in script
     assert 'JSON.stringify({confirm:true})' in script
-    assert 'app.js?v=0.16.0' in markup
+    assert 'app.js?v=0.16.1' in markup
     assert "local-first.js" not in markup
     assert 'api("/api/verify/local"' in script
     assert 'api("/api/verify/gate"' in script
@@ -188,6 +188,7 @@ def test_result_row_has_confirmed_single_container_photo_refresh_action():
 
     assert 'class="photo-refresh-button"' in script
     assert 'title="重新获取监装照片"' in script
+    assert '<path d="M21 3v5h-5"/>' in script
     assert 'message:"重新下载封箱照片。是否继续？"' in script
     assert 'api("/api/photos/refresh"' in script
     assert ".row-actions{display:flex" in styles

@@ -561,6 +561,7 @@ class PhotoPipeline:
                 target_type=target_type,
                 complete=crop_complete,
                 source_rotation=angle,
+                orientation_normalizer=self.engine.normalize_text_orientation,
             )
             result = {
                 **value,
@@ -570,7 +571,7 @@ class PhotoPipeline:
                 "photo_id": photo["id"],
                 "engine_version": "rapidocr-3",
                 "model_version": "onnx-cpu",
-                "preprocessing_version": "das-photo-ai-check-digit-fallback-v4",
+                "preprocessing_version": "das-photo-ai-upright-crop-v5",
             }
             if target_type == "seal" and not result.get("confidence"):
                 result["confidence"] = float(result.get("similarity", 0))
