@@ -156,7 +156,7 @@ def test_left_panel_allocates_remaining_height_to_departure_list():
     markup = (root / "static" / "index.html").read_text(encoding="utf-8")
     styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'styles.css?v=0.16.1' in markup
+    assert 'styles.css?v=0.16.3' in markup
     assert ".input-panel>textarea{height:200px" in styles
     assert ".departure-panel{display:flex;min-height:150px;flex:1 1 auto" in styles
     assert ".departure-list{min-height:70px;max-height:none;flex:1 1 auto" in styles
@@ -174,11 +174,19 @@ def test_empty_install_has_blocking_initial_import_dialog_contract():
     assert 'id="initial-import-confirm"' in markup
     assert 'api("/api/initial-import"' in script
     assert 'JSON.stringify({confirm:true})' in script
-    assert 'app.js?v=0.16.1' in markup
+    assert 'app.js?v=0.16.3' in markup
     assert "local-first.js" not in markup
     assert 'api("/api/verify/local"' in script
     assert 'api("/api/verify/gate"' in script
     assert "localRow.gate_needs_refresh" not in script
+    assert "verifyBatchSequence" in script
+    assert "activeVerifyBatch" in script
+    assert "void confirmVerifyBatch(batchId,containers,localRows)" in script
+    assert 'button.textContent="正在后台确认最新数据…"' not in script
+    assert (
+        'message:"最新门证和监装状态仍在后台确认。是否按当前本地核验结果继续打印？"'
+        in script
+    )
 
 
 def test_result_row_has_confirmed_single_container_photo_refresh_action():
@@ -193,6 +201,23 @@ def test_result_row_has_confirmed_single_container_photo_refresh_action():
     assert 'api("/api/photos/refresh"' in script
     assert ".row-actions{display:flex" in styles
     assert ".photo-refresh-button.checking svg{animation:refresh-spin" in styles
+    assert ".photo-refresh-button.confirmation-failed" in styles
+
+
+def test_original_photo_viewer_has_floating_rotation_and_reset_controls():
+    root = app_module.BASE_DIR
+    markup = (root / "static" / "index.html").read_text(encoding="utf-8")
+    script = (root / "static" / "app.js").read_text(encoding="utf-8")
+    styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'id="image-viewer-rotate"' in markup
+    assert 'title="顺时针旋转90°"' in markup
+    assert 'id="image-viewer-reset"' in markup
+    assert "viewerRotation=(viewerRotation+90)%360" in script
+    assert "scale(${viewerScale}) rotate(${viewerRotation}deg)" in script
+    assert "viewerScale=1;viewerX=0;viewerY=0;viewerRotation=0" in script
+    assert ".image-viewer-controls{position:absolute" in styles
+    assert ".image-viewer-tool:hover" in styles
 
 
 def test_photo_refresh_endpoint_returns_rebuilt_row(tmp_path, monkeypatch):

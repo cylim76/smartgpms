@@ -7,7 +7,7 @@
   <link rel="icon" href="/static/assets/smartgpms-app.ico?v=1" sizes="any">
   <link rel="icon" type="image/png" href="/static/assets/smartgpms-app.png?v=1">
   <link rel="apple-touch-icon" href="/static/assets/smartgpms-app.png?v=1">
-  <link rel="stylesheet" href="/static/styles.css?v=0.16.1">
+  <link rel="stylesheet" href="/static/styles.css?v=0.16.3">
 </head>
 <body>
   <header class="topbar">
@@ -65,7 +65,13 @@
     </section>
   </main>
   <div id="image-viewer" class="image-viewer hidden" role="dialog" aria-modal="true" aria-label="原图预览">
-    <div class="image-viewer-hint">滚轮缩放 · 按住图片拖动 · 点击空白处关闭</div>
+    <div class="image-viewer-hint">滚轮缩放 · 按住图片拖动 · 右上角旋转 · 点击空白处关闭</div>
+    <div class="image-viewer-controls" aria-label="原图查看工具">
+      <button id="image-viewer-rotate" class="image-viewer-tool image-viewer-rotate" type="button" title="顺时针旋转90°" aria-label="顺时针旋转90°">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v5h-5"/></svg>
+      </button>
+      <button id="image-viewer-reset" class="image-viewer-tool image-viewer-reset" type="button" title="恢复原始方向和大小">复位</button>
+    </div>
     <img id="image-viewer-photo" class="image-viewer-photo" alt="第四阶段原图" draggable="false">
   </div>
   <div id="initial-import-dialog" class="initial-import-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="initial-import-title">
@@ -98,6 +104,6 @@
     </section>
   </div>
   <div id="toast" role="status"></div>
-  <script src="/static/app.js?v=0.16.1"></script>
+  <script src="/static/app.js?v=0.16.3"></script>
 </body>
 </html>
