@@ -1,3 +1,5 @@
+from typing import ClassVar
+
 from PIL import Image
 
 from smartgpms.recognition import (
@@ -97,7 +99,7 @@ def test_save_crop_applies_final_human_orientation_normalizer(tmp_path):
 
 def test_rapidocr_orientation_classifier_rotates_only_confident_180():
     class FakeResult:
-        cls_res = [("180", 0.97)]
+        cls_res: ClassVar[list[tuple[str, float]]] = [("180", 0.97)]
 
     class FakeEngine:
         def __call__(self, image, **kwargs):

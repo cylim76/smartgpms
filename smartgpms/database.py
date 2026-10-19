@@ -176,6 +176,10 @@ class Database:
                     pdf_generated_at TEXT,
                     pdf_cleaned_at TEXT,
                     pdf_error TEXT NOT NULL DEFAULT '',
+                    pdf_verified_container_no TEXT NOT NULL DEFAULT '',
+                    pdf_source_url TEXT NOT NULL DEFAULT '',
+                    pdf_validation_version TEXT NOT NULL DEFAULT '',
+                    pdf_size INTEGER NOT NULL DEFAULT 0,
                     first_seen_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL,
                     last_checked_at TEXT NOT NULL
@@ -207,6 +211,32 @@ class Database:
                     expires_hint TEXT
                 );
                 INSERT OR IGNORE INTO session_state(id) VALUES (1);
+
+                CREATE TABLE IF NOT EXISTS app_users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'operator' CHECK(role IN ('admin','operator')),
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+                    is_protected INTEGER NOT NULL DEFAULT 0 CHECK(is_protected IN (0,1)),
+                    last_login_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_app_users_active
+                    ON app_users(is_active, username);
+
+                CREATE TABLE IF NOT EXISTS app_user_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_app_sessions_user
+                    ON app_user_sessions(user_id, expires_at);
+
                 CREATE TABLE IF NOT EXISTS background_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     job_type TEXT NOT NULL,
@@ -257,6 +287,16 @@ class Database:
                 {
                     "cache_status": "TEXT NOT NULL DEFAULT 'ready'",
                     "cleaned_at": "TEXT",
+                },
+            )
+            self._ensure_columns(
+                connection,
+                "gate_passes",
+                {
+                    "pdf_verified_container_no": "TEXT NOT NULL DEFAULT ''",
+                    "pdf_source_url": "TEXT NOT NULL DEFAULT ''",
+                    "pdf_validation_version": "TEXT NOT NULL DEFAULT ''",
+                    "pdf_size": "INTEGER NOT NULL DEFAULT 0",
                 },
             )
             timestamp = now_text()
@@ -335,6 +375,153 @@ class Database:
             connection.execute(
                 "UPDATE session_state SET status=?,username=?,message=?,checked_at=?,expires_hint=? WHERE id=1",
                 (status, username, message, now_text(), expires_hint),
+            )
+
+    def app_user_count(self) -> int:
+        with self.connect() as connection:
+            row = connection.execute("SELECT COUNT(*) AS value FROM app_users").fetchone()
+        return int(row["value"] or 0)
+
+    def create_app_user(
+        self,
+        username: str,
+        display_name: str,
+        password_hash: str,
+        role: str,
+        *,
+        is_protected: bool = False,
+    ) -> dict[str, Any]:
+        timestamp = now_text()
+        try:
+            with self.connect() as connection:
+                cursor = connection.execute(
+                    """INSERT INTO app_users(
+                           username,display_name,password_hash,role,is_active,
+                           is_protected,created_at,updated_at
+                       ) VALUES(?,?,?,?,1,?,?,?)""",
+                    (
+                        username,
+                        display_name,
+                        password_hash,
+                        role,
+                        int(is_protected),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                user_id = int(cursor.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("该用户名已经存在") from exc
+        return self.app_user_by_id(user_id) or {}
+
+    def app_user_by_id(self, user_id: int) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM app_users WHERE id=?", (user_id,)
+            ).fetchone()
+        return self._row(row)
+
+    def app_user_by_username(self, username: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM app_users WHERE username=? COLLATE NOCASE",
+                (username,),
+            ).fetchone()
+        return self._row(row)
+
+    def list_app_users(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """SELECT id,username,display_name,role,is_active,is_protected,
+                          last_login_at,created_at,updated_at
+                   FROM app_users
+                   ORDER BY is_protected DESC, role ASC, username COLLATE NOCASE"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_app_user(
+        self,
+        user_id: int,
+        *,
+        display_name: str,
+        role: str,
+        is_active: bool,
+    ) -> dict[str, Any]:
+        current = self.app_user_by_id(user_id)
+        if current is None:
+            raise KeyError("用户不存在")
+        if bool(current.get("is_protected")) and (
+            role != "admin" or not is_active
+        ):
+            raise ValueError("内置管理员不能停用或取消管理员权限")
+        with self.connect() as connection:
+            connection.execute(
+                """UPDATE app_users
+                   SET display_name=?,role=?,is_active=?,updated_at=? WHERE id=?""",
+                (display_name, role, int(is_active), now_text(), user_id),
+            )
+            if not is_active:
+                connection.execute(
+                    "DELETE FROM app_user_sessions WHERE user_id=?", (user_id,)
+                )
+        return self.app_user_by_id(user_id) or {}
+
+    def update_app_user_password(self, user_id: int, password_hash: str) -> None:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE app_users SET password_hash=?,updated_at=? WHERE id=?",
+                (password_hash, now_text(), user_id),
+            )
+            if not cursor.rowcount:
+                raise KeyError("用户不存在")
+            connection.execute(
+                "DELETE FROM app_user_sessions WHERE user_id=?", (user_id,)
+            )
+
+    def mark_app_user_login(self, user_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE app_users SET last_login_at=?,updated_at=? WHERE id=?",
+                (now_text(), now_text(), user_id),
+            )
+
+    def create_app_session(
+        self, token_hash: str, user_id: int, expires_at: str
+    ) -> None:
+        timestamp = now_text()
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM app_user_sessions WHERE expires_at<=?", (timestamp,)
+            )
+            connection.execute(
+                """INSERT INTO app_user_sessions(
+                       token_hash,user_id,created_at,last_seen_at,expires_at
+                   ) VALUES(?,?,?,?,?)""",
+                (token_hash, user_id, timestamp, timestamp, expires_at),
+            )
+
+    def resolve_app_session(
+        self, token_hash: str, *, touch: bool = True
+    ) -> dict[str, Any] | None:
+        timestamp = now_text()
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT u.* FROM app_user_sessions s
+                   JOIN app_users u ON u.id=s.user_id
+                   WHERE s.token_hash=? AND s.expires_at>? AND u.is_active=1""",
+                (token_hash, timestamp),
+            ).fetchone()
+            if row is not None and touch:
+                connection.execute(
+                    "UPDATE app_user_sessions SET last_seen_at=? WHERE token_hash=?",
+                    (timestamp, token_hash),
+                )
+        return self._row(row)
+
+    def delete_app_session(self, token_hash: str) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "DELETE FROM app_user_sessions WHERE token_hash=?", (token_hash,)
             )
 
     def upsert_cpm(
@@ -656,13 +843,32 @@ class Database:
             )
         return True
 
-    def mark_gate_pdf_ready(self, gate_key: str, path: str) -> None:
+    def mark_gate_pdf_ready(
+        self,
+        gate_key: str,
+        path: str,
+        *,
+        verified_container_no: str = "",
+        source_url: str = "",
+        validation_version: str = "",
+        size: int = 0,
+    ) -> None:
         with self.connect() as connection:
             connection.execute(
                 """UPDATE gate_passes SET pdf_path=?,pdf_status='ready',
-                       pdf_generated_at=?,pdf_cleaned_at=NULL,pdf_error=''
+                       pdf_generated_at=?,pdf_cleaned_at=NULL,pdf_error='',
+                       pdf_verified_container_no=?,pdf_source_url=?,
+                       pdf_validation_version=?,pdf_size=?
                    WHERE gate_key=?""",
-                (path, now_text(), gate_key),
+                (
+                    path,
+                    now_text(),
+                    verified_container_no.upper(),
+                    source_url,
+                    validation_version,
+                    max(0, int(size)),
+                    gate_key,
+                ),
             )
 
     def mark_gate_pdf_failed(self, gate_key: str, error: str) -> None:
@@ -686,7 +892,8 @@ class Database:
         with self.connect() as connection:
             connection.execute(
                 """UPDATE gate_passes SET pdf_path='',pdf_status='cleaned',
-                       pdf_cleaned_at=?,pdf_error='' WHERE gate_key=?""",
+                       pdf_cleaned_at=?,pdf_error='',pdf_size=0
+                   WHERE gate_key=?""",
                 (now_text(), gate_key),
             )
 

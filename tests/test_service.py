@@ -1319,6 +1319,71 @@ def test_gate_sync_requeues_pdf_when_cached_filename_is_outdated(tmp_path):
         service.stop()
 
 
+def test_gatepass_pdf_uses_verified_local_cache_and_replaces_legacy_cache(tmp_path):
+    database = Database(tmp_path / "data" / "test.sqlite3")
+    service = SmartGPMSService(
+        AppConfig(tmp_path),
+        database,
+        CredentialStore(tmp_path / "credentials.json"),
+    )
+    row = {
+        "application_date": "2026-10-19",
+        "container_no": "FFAU2997569",
+        "seal_no": "SEAL1",
+        "gate_pass_no": "PASS1",
+        "sequence_no": "2964225",
+        "process_status": "返出批准",
+        "planned_departure_at": "2026-10-19 08:49:00",
+        "status_url": (
+            "http://das/eGate/tm/R_EGT_GERPTMRESERVEDETAIL.aspx?"
+            "Regdate=20261019&Seqno=2964225&MailSeq=PASS1"
+        ),
+    }
+    record = service._gate_record(row)
+    database.upsert_gate_pass(record)
+    cached = service.gatepass_pdf_path(record)
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(b"%PDF-1.4\nwrong legacy page\n")
+    database.mark_gate_pdf_ready(record["gate_key"], str(cached))
+    calls = []
+
+    class GateBrowser:
+        @staticmethod
+        def download_gate_pdf(container_no, gate_pass_no, target):
+            calls.append((container_no, gate_pass_no))
+            target.write_bytes(b"%PDF-1.4\ncorrect gate detail\n")
+            return {
+                "ok": True,
+                "message": "门证 PDF 已生成",
+                "size": target.stat().st_size,
+                "detail": row,
+                "verified_container_no": container_no,
+                "source_url": row["status_url"],
+            }
+
+        @staticmethod
+        def close():
+            return None
+
+    service.browser = GateBrowser()
+    try:
+        saved, path, generated = service.ensure_gatepass_pdf(record)
+        assert calls == [("FFAU2997569", "PASS1")]
+        assert path.read_bytes() == b"%PDF-1.4\ncorrect gate detail\n"
+        assert generated["message"] == "门证 PDF 已生成"
+        assert saved["pdf_validation_version"] == "gate-detail-v1"
+        assert saved["pdf_verified_container_no"] == "FFAU2997569"
+        assert saved["pdf_size"] == path.stat().st_size
+
+        cached_saved, cached_path, cached_result = service.ensure_gatepass_pdf(saved)
+        assert calls == [("FFAU2997569", "PASS1")]
+        assert cached_path == path
+        assert cached_saved["gate_key"] == saved["gate_key"]
+        assert cached_result["message"] == "已读取本地通门证 PDF"
+    finally:
+        service.stop()
+
+
 def test_shutdown_finishes_current_job_but_does_not_claim_the_next(tmp_path):
     database = Database(tmp_path / "data" / "test.sqlite3")
     database.enqueue_job("download_ocr", "1")

@@ -9,6 +9,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .config import AppConfig
 from .das_parser import (
@@ -32,6 +33,10 @@ class LoginRequired(DasBrowserError):
     pass
 
 
+class DasUnavailable(DasBrowserError):
+    pass
+
+
 class GatePassNotFound(DasBrowserError):
     pass
 
@@ -48,6 +53,7 @@ class DasBrowser:
         self._current_gate_container = ""
         self._current_gate_opened_at = 0.0
         self._current_gate_record: dict[str, str] = {}
+        self._sso_username = ""
 
     @staticmethod
     def _is_closed_error(exc: BaseException) -> bool:
@@ -70,6 +76,7 @@ class DasBrowser:
         self._current_gate_container = ""
         self._current_gate_opened_at = 0.0
         self._current_gate_record = {}
+        self._sso_username = ""
         if context is not None:
             try:
                 context.close()
@@ -178,47 +185,185 @@ class DasBrowser:
             )
         )
 
+    @staticmethod
+    def _response_status(response: Any | None) -> int:
+        try:
+            return int(getattr(response, "status", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _sso_page_matches_username(source: str, username: str) -> bool:
+        lowered = source.lower()
+        principal = username.strip().lower().split("\\")[-1].split("@")[0]
+        if not principal:
+            return False
+        if principal in lowered:
+            return True
+        compact_source = re.sub(r"[^a-z0-9]", "", lowered[:200_000])
+        compact_principal = re.sub(r"[^a-z0-9]", "", principal)
+        return len(compact_principal) >= 5 and compact_principal in compact_source
+
+    @staticmethod
+    def _looks_das_unavailable(url: str, source: str) -> bool:
+        text = f"{url} {source[:20000]}".lower()
+        return any(
+            marker in text
+            for marker in (
+                "chrome-error://",
+                "err_connection_refused",
+                "err_connection_timed_out",
+                "service unavailable",
+                "http error 500",
+                "http error 502",
+                "http error 503",
+                "system maintenance",
+                "系统维护",
+                "服务不可用",
+                "점검 중",
+            )
+        )
+
+    @staticmethod
+    def _looks_like_gate_page(url: str, source: str) -> bool:
+        text = source[:100_000].lower()
+        return "das.china.lge.com" in url.lower() and any(
+            marker in text
+            for marker in (
+                'id="dgmain"',
+                "id='dgmain'",
+                "r_egt_tmgerpview.aspx",
+                "lbl_container_no",
+            )
+        )
+
+    def _clear_sso_cookies(self) -> None:
+        if self._context is not None:
+            self._context.clear_cookies()
+        self._sso_username = ""
+
+    @staticmethod
+    def _has_sso_login_form(page) -> bool:
+        return all(
+            page.locator(selector).count()
+            for selector in ("#USER", "#LDAPPASSWORD", "#OTPPASSWORD", "#loginSsobtn")
+        )
+
+    def _submit_sso_form(
+        self, page, username: str, password: str, otp: str
+    ) -> None:
+        if not password or not otp:
+            raise LoginRequired("当前需要重新登录 SSO，请输入密码和 OTP")
+        page.locator("#USER").fill(username)
+        page.locator("#USER").evaluate(
+            "el => el.dispatchEvent(new Event('blur', {bubbles:true}))"
+        )
+        page.wait_for_timeout(1500)
+        page.locator("#LDAPPASSWORD").fill(password)
+        otp_field = page.locator("#OTPPASSWORD")
+        otp_field.evaluate("el => el.style.display='block'")
+        otp_field.fill(otp)
+        page.locator("#loginSsobtn").click()
+        page.wait_for_timeout(1200)
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=30_000)
+        except PlaywrightTimeoutError:
+            page.wait_for_timeout(500)
+        source = page.content()
+        if self._looks_logged_out(page.url, source) or self._has_sso_login_form(page):
+            self._sso_username = ""
+            raise LoginRequired("SSO 登录未成功或 OTP 已失效")
+        self._sso_username = username.strip()
+
+    def _prepare_sso_session(
+        self, page, username: str, password: str, otp: str
+    ) -> bool:
+        """Return True when a credential form was submitted, False when reused."""
+        response = page.goto(
+            self.config.sso_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        status = self._response_status(response)
+        if status >= 400:
+            raise DasBrowserError(f"SSO 登录页面当前无法访问（HTTP {status}）")
+        if self._has_sso_login_form(page):
+            self._submit_sso_form(page, username, password, otp)
+            return True
+
+        source = page.content()
+        known_same_user = bool(
+            self._sso_username
+            and self._sso_username.casefold() == username.strip().casefold()
+        )
+        page_matches_user = self._sso_page_matches_username(source, username)
+        if known_same_user or page_matches_user:
+            self._sso_username = username.strip()
+            return False
+
+        # A persistent browser profile can contain a session belonging to a
+        # different or unknown user. Clear it before applying supplied credentials.
+        self._clear_sso_cookies()
+        response = page.goto(
+            self.config.sso_url,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+        status = self._response_status(response)
+        if status >= 400:
+            raise DasBrowserError(f"SSO 登录页面当前无法访问（HTTP {status}）")
+        if not self._has_sso_login_form(page):
+            raise DasBrowserError("SSO 登录页面未正常显示，请稍后重试")
+        self._submit_sso_form(page, username, password, otp)
+        return True
+
+    def _open_das_after_sso(self, page) -> None:
+        message = "SSO登录成功，但DAS系统当前无法访问，请稍后重试。"
+        try:
+            login_response = page.goto(
+                self.config.das_login_url,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            login_source = page.content()
+            if self._looks_logged_out(page.url, login_source):
+                raise LoginRequired("SSO 登录未成功或 OTP 已失效")
+            login_status = self._response_status(login_response)
+            if login_status >= 400 or self._looks_das_unavailable(
+                page.url, login_source
+            ):
+                raise DasUnavailable(message)
+
+            gate_response = page.goto(
+                self.config.gate_url,
+                wait_until="domcontentloaded",
+                timeout=60_000,
+            )
+            gate_source = page.content()
+            if self._looks_logged_out(page.url, gate_source):
+                raise LoginRequired("SSO 登录未成功或 OTP 已失效")
+            gate_status = self._response_status(gate_response)
+            if gate_status >= 400 or self._looks_das_unavailable(
+                page.url, gate_source
+            ) or not self._looks_like_gate_page(page.url, gate_source):
+                raise DasUnavailable(message)
+        except (DasUnavailable, LoginRequired):
+            raise
+        except Exception as exc:
+            if self._is_closed_error(exc):
+                raise
+            raise DasUnavailable(message) from exc
+
     def login(self, username: str, password: str, otp: str) -> dict[str, str | bool]:
-        if not username or not password or not otp:
-            raise DasBrowserError("用户名、密码和 OTP 均不能为空")
+        if not username:
+            raise DasBrowserError("用户名不能为空")
         with self._lock:
             try:
                 page = self.page
-                page.goto(
-                    self.config.sso_url,
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
-                )
-                page.locator("#USER").fill(username)
-                page.locator("#USER").evaluate(
-                    "el => el.dispatchEvent(new Event('blur', {bubbles:true}))"
-                )
-                page.wait_for_timeout(1500)
-                page.locator("#LDAPPASSWORD").fill(password)
-                otp_field = page.locator("#OTPPASSWORD")
-                otp_field.evaluate("el => el.style.display='block'")
-                otp_field.fill(otp)
-                page.locator("#loginSsobtn").click()
-                page.wait_for_timeout(1200)
-                from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
-                try:
-                    page.wait_for_load_state("domcontentloaded", timeout=30_000)
-                except PlaywrightTimeoutError:
-                    page.wait_for_timeout(500)
-                page.goto(
-                    self.config.das_login_url,
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
-                )
-                page.goto(
-                    self.config.gate_url,
-                    wait_until="domcontentloaded",
-                    timeout=60_000,
-                )
-                source = page.content()
-                if self._looks_logged_out(page.url, source):
-                    raise LoginRequired("SSO 登录未成功或 OTP 已失效")
+                self._prepare_sso_session(page, username, password, otp)
+                self._open_das_after_sso(page)
                 return {"ok": True, "url": page.url, "title": page.title()}
             except (DasBrowserError, LoginRequired):
                 raise
@@ -235,21 +380,26 @@ class DasBrowser:
             page = None
             try:
                 page = self.page
-                page.goto(
-                    self.config.das_login_url,
-                    wait_until="domcontentloaded",
-                    timeout=45_000,
-                )
-                page.goto(
-                    self.config.gate_url, wait_until="domcontentloaded", timeout=45_000
-                )
-                source = page.content()
-                logged_in = not self._looks_logged_out(page.url, source)
+                self._open_das_after_sso(page)
                 return {
-                    "logged_in": logged_in,
+                    "logged_in": True,
                     "url": page.url,
                     "title": page.title(),
-                    "message": "会话有效" if logged_in else "需要重新登录",
+                    "message": "会话有效",
+                }
+            except LoginRequired:
+                return {
+                    "logged_in": False,
+                    "url": getattr(page, "url", "") if page is not None else "",
+                    "title": "",
+                    "message": "需要重新登录",
+                }
+            except DasUnavailable as exc:
+                return {
+                    "logged_in": False,
+                    "url": getattr(page, "url", "") if page is not None else "",
+                    "title": "",
+                    "message": str(exc),
                 }
             except Exception as exc:  # noqa: BLE001 - session probes must return a status, not crash the worker
                 closed = self._is_closed_error(exc)
@@ -269,15 +419,7 @@ class DasBrowser:
     def refresh_das(self):
         with self._lock:
             page = self.page
-            page.goto(
-                self.config.das_login_url, wait_until="domcontentloaded", timeout=45_000
-            )
-            page.goto(
-                self.config.gate_url, wait_until="domcontentloaded", timeout=45_000
-            )
-            source = page.content()
-            if self._looks_logged_out(page.url, source):
-                raise LoginRequired("DAS 会话已失效")
+            self._open_das_after_sso(page)
             return page
 
     def _save_excel_export(self, page, prefix: str) -> str:
@@ -565,7 +707,7 @@ class DasBrowser:
                 for row in parse_gate_search_rows(source, page.url)
                 if row.get("container_no") == wanted
                 and (not gate_pass_no or row.get("gate_pass_no") == gate_pass_no)
-                and row.get("event_target")
+                and (row.get("status_url") or row.get("event_target"))
             ]
             if not candidates:
                 raise GatePassNotFound(f"未找到箱号 {container_no} 的门证")
@@ -581,20 +723,38 @@ class DasBrowser:
             )
             event_target = selected["event_target"]
             popup = None
-            try:
-                with page.expect_popup(timeout=10_000) as popup_info:
-                    page.evaluate(
-                        "target => window.__doPostBack(target, '')", event_target
-                    )
-                popup = popup_info.value
-                popup.wait_for_load_state("domcontentloaded")
-            except PlaywrightTimeoutError:
-                page.wait_for_timeout(1000)
+            status_url = str(selected.get("status_url", "")).strip()
+            if status_url:
+                page.goto(
+                    status_url,
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
+            else:
+                try:
+                    with page.expect_popup(timeout=10_000) as popup_info:
+                        page.evaluate(
+                            "target => window.__doPostBack(target, '')", event_target
+                        )
+                    popup = popup_info.value
+                    popup.wait_for_load_state("domcontentloaded")
+                except PlaywrightTimeoutError:
+                    page.wait_for_timeout(1000)
             detail_page = popup or page
             detail_source = detail_page.content()
             values = parse_gate_detail(detail_source)
-            if not values["container_no"]:
-                raise DasBrowserError("DAS 回发后未取得门证详情页")
+            actual = re.sub(
+                r"[^A-Z0-9]", "", str(values.get("container_no", "")).upper()
+            )
+            if actual != wanted:
+                raise DasBrowserError(
+                    f"DAS 门证详情页箱号校验失败：期望 {wanted}，实际 {actual or '无'}"
+                )
+            detail_path = urlparse(detail_page.url).path.lower()
+            if not detail_path.endswith("/r_egt_gerptmreservedetail.aspx"):
+                raise DasBrowserError(
+                    f"DAS 未进入门证详情页，已停止生成 PDF：{detail_page.url}"
+                )
             values = {
                 **selected,
                 **values,
@@ -752,4 +912,18 @@ class DasBrowser:
                 "ok": True,
                 "message": "门证 PDF 已生成，请在打印窗口中完成打印",
                 "size": target.stat().st_size,
+            }
+
+    def download_gate_pdf(
+        self, container_no: str, gate_pass_no: str, target: Path
+    ) -> dict[str, Any]:
+        """Open, verify and export one gate pass without releasing the browser."""
+        with self._lock:
+            detail = self.open_gate_detail(container_no, gate_pass_no)
+            result = self.export_current_gate_pdf(target)
+            return {
+                **result,
+                "detail": detail,
+                "verified_container_no": str(detail.get("container_no", "")),
+                "source_url": str(detail.get("url", "")),
             }

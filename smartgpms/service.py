@@ -8,6 +8,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -17,7 +18,7 @@ from typing import Any
 
 from .config import AppConfig
 from .credentials import CredentialStore
-from .das_browser import DasBrowser, LoginRequired
+from .das_browser import DasBrowser, DasUnavailable, LoginRequired
 from .database import Database, now_text
 from .photo_pipeline import PhotoPipeline
 from .scheduling import AdaptiveSyncSchedule
@@ -27,6 +28,7 @@ from .updater import GitRevisionMonitor
 LOGGER = logging.getLogger(__name__)
 ACTIVITY_RETENTION_SECONDS = 2 * 60 * 60
 INITIAL_IMPORT_DAYS = 30
+GATE_PDF_VALIDATION_VERSION = "gate-detail-v1"
 
 
 class ServiceStopping(RuntimeError):
@@ -241,7 +243,9 @@ class SmartGPMSService:
         self, username: str, password: str, otp: str, remember: bool
     ) -> dict[str, Any]:
         self.database.update_session("logging_in", username, "正在登录")
-        self.log_activity("正在登录 SSO，并建立 DAS 会话", source="login")
+        self.log_activity(
+            f"后台连接：{username} 正在登录 SSO，并建立 DAS 会话", source="login"
+        )
         try:
             result = self._browser_call(self.browser.login, username, password, otp)
             if remember:
@@ -259,8 +263,12 @@ class SmartGPMSService:
                 message = "登录成功；后台巡检将在 07:00–23:59 自动运行"
             else:
                 message = "登录成功；即将初始化最近30天监装及门证数据"
-            self.log_activity(message, source="login")
+            self.log_activity(f"后台连接：{username} {message}", source="login")
             return {**result, "initial_import": initial_import}
+        except DasUnavailable as exc:
+            self.database.update_session("logged_out", username, str(exc))
+            self.log_activity(str(exc), "warning", "login")
+            raise
         except Exception as exc:
             self.database.update_session("logged_out", username, str(exc))
             self.log_activity(f"登录失败：{exc}", "error", "login")
@@ -662,12 +670,8 @@ class SmartGPMSService:
                 scanned += 1
                 pdf_path = Path(str(saved.get("pdf_path", "")))
                 expected_pdf_path = self.gatepass_pdf_path(saved)
-                needs_pdf = (
-                    previous is None
-                    or changed
-                    or saved.get("pdf_status") != "ready"
-                    or not pdf_path.is_file()
-                    or pdf_path.resolve() != expected_pdf_path.resolve()
+                needs_pdf = previous is None or changed or not self._gate_pdf_cached(
+                    saved, pdf_path, expected_pdf_path
                 )
                 if needs_pdf:
                     queued += int(
@@ -698,7 +702,9 @@ class SmartGPMSService:
             if not _task_lock_owned:
                 self._task_lock.release()
 
-    def save_gate_detail(self, gate: dict[str, Any]) -> dict[str, Any]:
+    def save_gate_detail(
+        self, gate: dict[str, Any], *, queue_pdf: bool = True
+    ) -> dict[str, Any]:
         record = self._gate_record(gate)
         previous, saved = self.database.upsert_gate_pass(record)
         planned_date = self._normalized_gate_date(
@@ -711,12 +717,10 @@ class SmartGPMSService:
             previous
             and previous.get("source_fingerprint") != saved.get("source_fingerprint")
         )
-        if not self._gate_has_departed(saved) and planned_date == today and (
+        if queue_pdf and not self._gate_has_departed(saved) and planned_date == today and (
             previous is None
             or changed
-            or saved.get("pdf_status") != "ready"
-            or not pdf_path.is_file()
-            or pdf_path.resolve() != expected_pdf_path.resolve()
+            or not self._gate_pdf_cached(saved, pdf_path, expected_pdf_path)
         ):
             self.database.enqueue_job("gate_pdf", str(saved["gate_key"]))
         return saved
@@ -742,36 +746,74 @@ class SmartGPMSService:
         filename = f"{prefix}_{container}_{pass_no or 'GATEPASS'}.pdf"
         return self.config.gatepass_dir / year / month / filename
 
+    @staticmethod
+    def _normalized_container(value: Any) -> str:
+        return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+    def _gate_pdf_cached(
+        self,
+        gate: dict[str, Any],
+        path: Path | None = None,
+        expected: Path | None = None,
+    ) -> bool:
+        cached = path or Path(str(gate.get("pdf_path", "")))
+        wanted_path = expected or self.gatepass_pdf_path(gate)
+        wanted_container = self._normalized_container(gate.get("container_no", ""))
+        verified_container = self._normalized_container(
+            gate.get("pdf_verified_container_no", "")
+        )
+        source_url = str(gate.get("pdf_source_url", "")).lower()
+        try:
+            size_matches = int(gate.get("pdf_size", 0)) == cached.stat().st_size
+        except (OSError, TypeError, ValueError):
+            size_matches = False
+        return bool(
+            gate.get("pdf_status") == "ready"
+            and cached.is_file()
+            and cached.resolve() == wanted_path.resolve()
+            and wanted_container
+            and verified_container == wanted_container
+            and gate.get("pdf_validation_version") == GATE_PDF_VALIDATION_VERSION
+            and "r_egt_gerptmreservedetail.aspx" in source_url
+            and size_matches
+        )
+
     def ensure_gatepass_pdf(
         self, gate: dict[str, Any], *, allow_cached: bool = True
     ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
         current = self.database.gate_pass_by_key(str(gate["gate_key"])) or gate
         cached = Path(str(current.get("pdf_path", "")))
         expected = self.gatepass_pdf_path(current)
-        if (
-            allow_cached
-            and current.get("pdf_status") == "ready"
-            and cached.is_file()
-            and cached.resolve() == expected.resolve()
-        ):
+        if allow_cached and self._gate_pdf_cached(current, cached, expected):
             return current, cached, {"ok": True, "message": "已读取本地通门证 PDF"}
-        detail = self._browser_call(
-            self.browser.open_gate_detail,
-            str(current["container_no"]),
-            str(current.get("gate_pass_no", "")),
-        )
-        saved = self.save_gate_detail(detail)
-        target = self.gatepass_pdf_path(saved)
-        temporary = target.with_name(f".{target.stem}.tmp.pdf")
+        temporary = self.config.print_spool_dir / f"gate-{uuid.uuid4().hex}.tmp.pdf"
         temporary.parent.mkdir(parents=True, exist_ok=True)
+        failed_gate_key = str(current["gate_key"])
         try:
-            result = self._browser_call(self.browser.export_current_gate_pdf, temporary)
+            result = self._browser_call(
+                self.browser.download_gate_pdf,
+                str(current["container_no"]),
+                str(current.get("gate_pass_no", "")),
+                temporary,
+            )
+            detail = dict(result.pop("detail"))
+            saved = self.save_gate_detail(detail, queue_pdf=False)
+            failed_gate_key = str(saved["gate_key"])
+            target = self.gatepass_pdf_path(saved)
+            target.parent.mkdir(parents=True, exist_ok=True)
             temporary.replace(target)
-            self.database.mark_gate_pdf_ready(str(saved["gate_key"]), str(target))
+            self.database.mark_gate_pdf_ready(
+                str(saved["gate_key"]),
+                str(target),
+                verified_container_no=str(result.get("verified_container_no", "")),
+                source_url=str(result.get("source_url", "")),
+                validation_version=GATE_PDF_VALIDATION_VERSION,
+                size=target.stat().st_size,
+            )
             self._remove_replaced_gate_pdf(cached, target)
         except Exception as exc:
             temporary.unlink(missing_ok=True)
-            self.database.mark_gate_pdf_failed(str(saved["gate_key"]), str(exc))
+            self.database.mark_gate_pdf_failed(failed_gate_key, str(exc))
             raise
         return self.database.gate_pass_by_key(str(saved["gate_key"])) or saved, target, result
 
@@ -1047,11 +1089,25 @@ class SmartGPMSService:
     def check_session(self) -> dict[str, Any]:
         result = self._browser_call(self.browser.check_session)
         previous = self.database.session()
+        next_status = "logged_in" if result["logged_in"] else "logged_out"
+        message = str(result.get("message", ""))
         self.database.update_session(
-            "logged_in" if result["logged_in"] else "logged_out",
+            next_status,
             str(previous.get("username", "")),
-            str(result.get("message", "")),
+            message,
         )
+        if str(previous.get("status", "")) != next_status:
+            backend_user = str(previous.get("username", "")).strip()
+            prefix = f"{backend_user} " if backend_user else ""
+            self.log_activity(
+                (
+                    f"后台连接：{prefix}DAS 已连接"
+                    if next_status == "logged_in"
+                    else f"后台连接：{prefix}{message or 'DAS 会话已失效，需要重新登录'}"
+                ),
+                "info" if next_status == "logged_in" else "warning",
+                "session",
+            )
         return result
 
     def _finish_background_job(

@@ -7,7 +7,13 @@ import pytest
 
 import smartgpms.das_browser as das_browser_module
 from smartgpms.config import AppConfig
-from smartgpms.das_browser import DasBrowser, GatePassNotFound
+from smartgpms.das_browser import (
+    DasBrowser,
+    DasBrowserError,
+    DasUnavailable,
+    GatePassNotFound,
+    LoginRequired,
+)
 
 
 class FakePage:
@@ -168,6 +174,179 @@ def test_logout_clears_persistent_cookies_before_closing_browser(tmp_path):
     assert browser._context is None
 
 
+def test_login_reuses_matching_sso_session_then_reports_das_maintenance(tmp_path):
+    browser = DasBrowser(AppConfig(tmp_path))
+
+    class MissingLocator:
+        @staticmethod
+        def count():
+            return 0
+
+    class ExistingSessionPage(FakePage):
+        def __init__(self):
+            super().__init__()
+            self.source = "<html>QINGLONG.LIN portal</html>"
+
+        def goto(self, url, **_kwargs):
+            self.url = url
+            if "das.china.lge.com" in url:
+                raise RuntimeError("net::ERR_CONNECTION_REFUSED")
+            return SimpleNamespace(status=200)
+
+        @staticmethod
+        def locator(_selector):
+            return MissingLocator()
+
+        def content(self):
+            return self.source
+
+    page = ExistingSessionPage()
+    context = FakeContext([page])
+    browser._page = page
+    browser._context = context
+    browser._playwright = FakePlaywright(context)
+
+    with pytest.raises(
+        DasUnavailable, match="SSO登录成功，但DAS系统当前无法访问"
+    ):
+        browser.login("qinglong.lin", "", "")
+
+    assert browser._sso_username == "qinglong.lin"
+    assert browser._context is context
+
+
+def test_unknown_persistent_sso_user_is_cleared_before_form_login(tmp_path):
+    browser = DasBrowser(AppConfig(tmp_path))
+
+    class LoginLocator:
+        def __init__(self, page, selector):
+            self.page = page
+            self.selector = selector
+            self.value = ""
+
+        def count(self):
+            return int(self.page.form_visible)
+
+        def fill(self, value):
+            self.value = value
+
+        @staticmethod
+        def evaluate(_script):
+            return None
+
+        def click(self):
+            if self.selector == "#loginSsobtn":
+                self.page.form_visible = False
+                self.page.source = "<html>qinglong.lin portal</html>"
+
+    class LoginPage(FakePage):
+        def __init__(self):
+            super().__init__()
+            self.form_visible = False
+            self.source = "<html>different.user portal</html>"
+            self.fields = {}
+
+        def goto(self, url, **_kwargs):
+            self.url = url
+            if context.cookies_cleared:
+                self.form_visible = True
+                self.source = '<input id="USER"><input id="LDAPPASSWORD">'
+            return SimpleNamespace(status=200)
+
+        def locator(self, selector):
+            return self.fields.setdefault(selector, LoginLocator(self, selector))
+
+        def content(self):
+            return self.source
+
+        @staticmethod
+        def wait_for_timeout(_timeout):
+            return None
+
+        @staticmethod
+        def wait_for_load_state(*_args, **_kwargs):
+            return None
+
+    class CookieContext(FakeContext):
+        cookies_cleared = False
+
+        def clear_cookies(self):
+            self.cookies_cleared = True
+
+    page = LoginPage()
+    context = CookieContext([page])
+    browser._page = page
+    browser._context = context
+    browser._playwright = FakePlaywright(context)
+
+    submitted = browser._prepare_sso_session(
+        page, "qinglong.lin", "password", "123456"
+    )
+
+    assert submitted is True
+    assert context.cookies_cleared
+    assert page.fields["#USER"].value == "qinglong.lin"
+    assert page.fields["#LDAPPASSWORD"].value == "password"
+    assert page.fields["#OTPPASSWORD"].value == "123456"
+    assert browser._sso_username == "qinglong.lin"
+
+
+def test_visible_sso_form_still_requires_password_and_otp(tmp_path):
+    browser = DasBrowser(AppConfig(tmp_path))
+
+    with pytest.raises(LoginRequired, match="请输入密码和 OTP"):
+        browser._submit_sso_form(object(), "qinglong.lin", "", "")
+
+
+def test_das_maintenance_page_is_not_treated_as_success(tmp_path):
+    browser = DasBrowser(AppConfig(tmp_path))
+
+    class MaintenancePage(FakePage):
+        def __init__(self):
+            super().__init__()
+            self.source = "<html>系统维护</html>"
+
+        def goto(self, url, **_kwargs):
+            self.url = url
+            return SimpleNamespace(status=503)
+
+        def content(self):
+            return self.source
+
+    page = MaintenancePage()
+
+    with pytest.raises(DasUnavailable, match="DAS系统当前无法访问"):
+        browser._open_das_after_sso(page)
+
+    context = FakeContext([page])
+    browser._page = page
+    browser._context = context
+    browser._playwright = FakePlaywright(context)
+    state = browser.check_session()
+    assert state["logged_in"] is False
+    assert state["message"] == "SSO登录成功，但DAS系统当前无法访问，请稍后重试。"
+    assert browser._context is context
+
+
+def test_http_200_maintenance_page_is_not_treated_as_das_success(tmp_path):
+    browser = DasBrowser(AppConfig(tmp_path))
+
+    class MaintenancePage(FakePage):
+        def __init__(self):
+            super().__init__()
+            self.source = "<html><h1>Temporarily offline</h1></html>"
+
+        def goto(self, url, **_kwargs):
+            self.url = url
+            return SimpleNamespace(status=200)
+
+        def content(self):
+            return self.source
+
+    with pytest.raises(DasUnavailable, match="DAS系统当前无法访问"):
+        browser._open_das_after_sso(MaintenancePage())
+
+
 def test_gate_query_without_detail_link_is_not_found(tmp_path, monkeypatch):
     browser = DasBrowser(AppConfig(tmp_path))
 
@@ -320,6 +499,75 @@ def test_export_current_gate_pdf_uses_print_media(tmp_path):
     assert page.media == ["print", "screen"]
     assert page.pdf_options["print_background"] is True
     assert page.pdf_options["prefer_css_page_size"] is True
+
+
+def test_open_gate_detail_rejects_a_non_gate_detail_page(tmp_path, monkeypatch):
+    browser = DasBrowser(AppConfig(tmp_path))
+
+    class WrongPage(FakePage):
+        def __init__(self):
+            super().__init__()
+            self.url = "http://das/eGate/tm/R_EGT_TMGERPVIEW.aspx"
+
+        def goto(self, url, **_kwargs):
+            self.url = url
+
+        @staticmethod
+        def content():
+            return (
+                '<span id="lbl_container_no">FFAU2997569</span>'
+                '<span id="lbl_seal_no">SEAL123</span>'
+            )
+
+    page = WrongPage()
+    monkeypatch.setattr(browser, "refresh_das", lambda: page)
+    monkeypatch.setattr(browser, "_query_container", lambda *_args: None)
+    monkeypatch.setattr(
+        "smartgpms.das_browser.parse_gate_search_rows",
+        lambda *_args: [
+            {
+                "container_no": "FFAU2997569",
+                "gate_pass_no": "PASS1",
+                "planned_departure_at": "2026-10-19 08:00:00",
+                "sequence_no": "1",
+                "event_target": "",
+                "status_url": "http://das/Manage/cpm/R_CPM_SEARCH.aspx",
+            }
+        ],
+    )
+
+    with pytest.raises(DasBrowserError, match="未进入门证详情页"):
+        browser.open_gate_detail("FFAU2997569", "PASS1")
+
+
+def test_download_gate_pdf_returns_verified_detail_metadata(tmp_path, monkeypatch):
+    browser = DasBrowser(AppConfig(tmp_path))
+    target = tmp_path / "gate.pdf"
+    calls = []
+    detail = {
+        "container_no": "FFAU2997569",
+        "gate_pass_no": "PASS1",
+        "url": "http://das/eGate/tm/R_EGT_GERPTMRESERVEDETAIL.aspx?Seqno=1",
+    }
+
+    def open_detail(container_no, gate_pass_no):
+        calls.append(("open", container_no, gate_pass_no))
+        return detail
+
+    def export_pdf(path):
+        calls.append(("export", path))
+        path.write_bytes(b"%PDF-1.4\nverified gate pass\n")
+        return {"ok": True, "message": "generated", "size": path.stat().st_size}
+
+    monkeypatch.setattr(browser, "open_gate_detail", open_detail)
+    monkeypatch.setattr(browser, "export_current_gate_pdf", export_pdf)
+
+    result = browser.download_gate_pdf("FFAU2997569", "PASS1", target)
+
+    assert [call[0] for call in calls] == ["open", "export"]
+    assert result["detail"] == detail
+    assert result["verified_container_no"] == "FFAU2997569"
+    assert "R_EGT_GERPTMRESERVEDETAIL.aspx" in result["source_url"]
 
 
 def test_excel_export_waits_for_download_and_removes_temporary_file(tmp_path):

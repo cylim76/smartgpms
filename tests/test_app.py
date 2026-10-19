@@ -5,6 +5,7 @@ import pytest
 from fastapi import HTTPException
 
 import app as app_module
+from smartgpms.das_browser import DasUnavailable
 from smartgpms.database import Database
 from smartgpms.time_utils import business_now
 
@@ -36,6 +37,29 @@ def test_local_verification_returns_without_opening_das(tmp_path, monkeypatch):
     assert result["rows"][0]["cpm_id"] == "100715"
     assert result["rows"][0]["gate_status"] == "pending"
     assert result["rows"][0]["gate_container_no"] == ""
+
+
+def test_login_reports_das_maintenance_without_generic_browser_prefix(monkeypatch):
+    monkeypatch.setattr(
+        app_module.service,
+        "login",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            DasUnavailable("SSO登录成功，但DAS系统当前无法访问，请稍后重试。")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as error:
+        app_module._login_sso(
+            app_module.SsoLoginPayload(
+                username="qinglong.lin",
+                password="password",
+                otp="123456",
+            ),
+            {"id": 1, "username": "operator"},
+        )
+
+    assert error.value.status_code == 503
+    assert error.value.detail == "SSO登录成功，但DAS系统当前无法访问，请稍后重试。"
 
 
 def test_full_verification_refreshes_mapping_even_when_local_record_exists(
@@ -156,7 +180,7 @@ def test_left_panel_allocates_remaining_height_to_departure_list():
     markup = (root / "static" / "index.html").read_text(encoding="utf-8")
     styles = (root / "static" / "styles.css").read_text(encoding="utf-8")
 
-    assert 'styles.css?v=0.16.3' in markup
+    assert 'styles.css?v=0.18.0' in markup
     assert ".input-panel>textarea{height:200px" in styles
     assert ".departure-panel{display:flex;min-height:150px;flex:1 1 auto" in styles
     assert ".departure-list{min-height:70px;max-height:none;flex:1 1 auto" in styles
@@ -174,7 +198,7 @@ def test_empty_install_has_blocking_initial_import_dialog_contract():
     assert 'id="initial-import-confirm"' in markup
     assert 'api("/api/initial-import"' in script
     assert 'JSON.stringify({confirm:true})' in script
-    assert 'app.js?v=0.16.3' in markup
+    assert 'app.js?v=0.18.0' in markup
     assert "local-first.js" not in markup
     assert 'api("/api/verify/local"' in script
     assert 'api("/api/verify/gate"' in script
@@ -240,9 +264,15 @@ def test_photo_refresh_endpoint_returns_rebuilt_row(tmp_path, monkeypatch):
         lambda _payload: {"rows": [{"input_container": "MSCU6639870"}]},
     )
 
-    result = app_module.refresh_photos(
-        app_module.PhotoRefreshPayload(container="MSCU6639870")
+    context = app_module._current_app_user.set(
+        {"id": 1, "username": "operator", "role": "operator"}
     )
+    try:
+        result = app_module.refresh_photos(
+            app_module.PhotoRefreshPayload(container="MSCU6639870")
+        )
+    finally:
+        app_module._current_app_user.reset(context)
 
     assert result["row"]["input_container"] == "MSCU6639870"
     assert result["message"] == "已采用最新监装记录并更新 4 张封箱照片"
@@ -261,14 +291,19 @@ def test_initial_import_endpoint_requires_login_and_confirmation(
         app_module.configure_initial_import(app_module.InitialImportPayload())
     assert logged_out.value.status_code == 401
 
-    database.update_session("logged_in", "operator", "会话有效")
-    with pytest.raises(HTTPException) as invalid:
-        app_module.configure_initial_import(
-            app_module.InitialImportPayload(confirm=False)
-        )
-    assert invalid.value.status_code == 400
+    context = app_module._current_app_user.set(
+        {"id": 1, "username": "operator", "role": "operator"}
+    )
+    try:
+        with pytest.raises(HTTPException) as invalid:
+            app_module.configure_initial_import(
+                app_module.InitialImportPayload(confirm=False)
+            )
+        assert invalid.value.status_code == 400
 
-    result = app_module.configure_initial_import(app_module.InitialImportPayload())
+        result = app_module.configure_initial_import(app_module.InitialImportPayload())
+    finally:
+        app_module._current_app_user.reset(context)
     assert result["ok"] is True
     assert result["days"] == 30
     assert result["required"] is False
@@ -289,12 +324,15 @@ def test_print_spool_copy_does_not_inherit_expired_cache_timestamp(tmp_path):
     assert staged_pdf.stat().st_mtime >= time.time() - 5
 
 
-def test_topbar_keeps_only_page_reload_and_polls_session_status():
+def test_topbar_shows_application_user_and_polls_backend_session_status():
     root = app_module.BASE_DIR
     markup = (root / "static" / "index.html").read_text(encoding="utf-8")
     script = (root / "static" / "app.js").read_text(encoding="utf-8")
 
     assert 'id="check-session"' not in markup
+    assert 'id="session-dot"' not in markup
+    assert 'id="current-user"' in markup
+    assert 'id="app-logout"' in markup
     assert 'id="reload-page"' in markup
     assert 'title="刷新页面"' in markup
     assert '$("#reload-page").addEventListener("click",()=>window.location.reload())' in script
@@ -307,10 +345,16 @@ def test_session_status_endpoint_reads_cached_database_state(tmp_path, monkeypat
     database.update_session("logged_in", "operator.one", "会话有效")
     monkeypatch.setattr(app_module, "database", database)
 
-    result = app_module.session_status()
+    context = app_module._current_app_user.set(
+        {"id": 7, "username": "local.operator", "role": "operator"}
+    )
+    try:
+        result = app_module.session_status()
+    finally:
+        app_module._current_app_user.reset(context)
 
     assert result["status"] == "logged_in"
-    assert result["username"] == "operator.one"
+    assert "username" not in result
 
 
 def test_result_legend_is_stacked_below_heading_compactly():

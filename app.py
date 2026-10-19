@@ -8,19 +8,26 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
+from smartgpms.auth import AuthManager, public_user
 from smartgpms.config import AppConfig
 from smartgpms.credentials import CredentialStore
-from smartgpms.das_browser import DasBrowserError, GatePassNotFound, LoginRequired
+from smartgpms.das_browser import (
+    DasBrowserError,
+    DasUnavailable,
+    GatePassNotFound,
+    LoginRequired,
+)
 from smartgpms.database import Database
 from smartgpms.iso6346 import normalize, validate_container_number
 from smartgpms.service import ServiceStopping, SmartGPMSService
@@ -36,12 +43,53 @@ database.activate_ocr_pipeline(
     "das-photo-ai-check-digit-fallback-v4", incomplete_container_only=True
 )
 credentials = CredentialStore(DATA_DIR / "credentials.json")
+auth = AuthManager(database)
 service = SmartGPMSService(config, database, credentials)
 pending_prints: dict[str, dict[str, Any]] = {}
 pending_prints_lock = threading.Lock()
 PENDING_PRINT_TTL_SECONDS = 600
 desktop_shutdown_callback: Callable[[], None] | None = None
 desktop_shutdown_started = threading.Event()
+APP_SESSION_COOKIE = "smartgpms_session"
+APP_SESSION_MAX_AGE = 12 * 60 * 60
+APP_COOKIE_SECURE = os.environ.get("SMARTGPMS_SECURE_COOKIES", "0").strip() == "1"
+_current_app_user: ContextVar[dict[str, Any] | None] = ContextVar(
+    "smartgpms_current_user", default=None
+)
+
+
+class SsoLoginCoordinator:
+    """Give one application user a short lease to establish the shared DAS session."""
+
+    def __init__(self, lease_seconds: float = 120.0):
+        self.lease_seconds = lease_seconds
+        self._lock = threading.Lock()
+        self._owner_id: int | None = None
+        self._expires_at = 0.0
+
+    def claim(self, user_id: int) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            if self._owner_id is None or now >= self._expires_at:
+                self._owner_id = user_id
+                self._expires_at = now + self.lease_seconds
+            return self._owner_id == user_id
+
+    def touch(self, user_id: int) -> bool:
+        with self._lock:
+            if self._owner_id != user_id:
+                return False
+            self._expires_at = time.monotonic() + self.lease_seconds
+            return True
+
+    def release(self, user_id: int | None = None) -> None:
+        with self._lock:
+            if user_id is None or self._owner_id == user_id:
+                self._owner_id = None
+                self._expires_at = 0.0
+
+
+sso_login_coordinator = SsoLoginCoordinator()
 
 
 def configure_desktop_shutdown(callback: Callable[[], None]) -> None:
@@ -64,11 +112,76 @@ async def lifespan(_: FastAPI):
     service.stop()
 
 
-app = FastAPI(title="smartGPMS", version="0.17.2", lifespan=lifespan)
+app = FastAPI(title="smartGPMS", version="0.18.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-class LoginPayload(BaseModel):
+PUBLIC_API_PATHS = {
+    "/api/bootstrap",
+    "/api/auth/login",
+    "/api/auth/setup",
+    "/api/health",
+}
+
+
+@app.middleware("http")
+async def require_application_login(request: Request, call_next):
+    token = request.cookies.get(APP_SESSION_COOKIE, "")
+    user = auth.resolve_session(token) if token else None
+    request.state.app_user = user
+    context_token = _current_app_user.set(user)
+    try:
+        path = request.url.path
+        protected_api = path.startswith("/api/") and path not in PUBLIC_API_PATHS
+        if path == "/api/desktop/shutdown" and RUN_MODE == "desktop":
+            protected_api = False
+        if protected_api and user is None:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": "请先登录 smartGPMS",
+                    "code": "APP_AUTH_REQUIRED",
+                },
+            )
+        return await call_next(request)
+    finally:
+        _current_app_user.reset(context_token)
+
+
+class AppSetupPayload(BaseModel):
+    username: str
+    display_name: str = ""
+    password: str
+
+
+class AppLoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class AppUserCreatePayload(BaseModel):
+    username: str
+    display_name: str = ""
+    password: str
+    role: str = "operator"
+
+
+class AppUserUpdatePayload(BaseModel):
+    display_name: str = ""
+    role: str = "operator"
+    is_active: bool = True
+
+
+class AppPasswordResetPayload(BaseModel):
+    password: str
+
+
+class AppPasswordChangePayload(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class SsoLoginPayload(BaseModel):
     username: str
     password: str = ""
     otp: str
@@ -119,14 +232,55 @@ def _clean_numbers(values: list[str]) -> list[str]:
     return output
 
 
+def _application_user() -> dict[str, Any]:
+    user = _current_app_user.get()
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="请先登录 smartGPMS",
+            headers={"X-smartGPMS-Error": "APP_AUTH_REQUIRED"},
+        )
+    return user
+
+
 def _logged_in_username() -> str:
-    session_state = database.session()
-    if session_state.get("status") != "logged_in":
-        raise HTTPException(status_code=401, detail="请先登录 SSO")
-    username = str(session_state.get("username", "")).strip()
-    if not username:
-        raise HTTPException(status_code=401, detail="当前登录用户信息无效")
-    return username
+    return str(_application_user()["username"])
+
+
+def _require_admin() -> dict[str, Any]:
+    user = _application_user()
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="只有管理员可以执行此操作")
+    return user
+
+
+def _backend_public_state() -> dict[str, Any]:
+    state = database.session()
+    return {
+        "status": str(state.get("status", "logged_out")),
+        "message": str(state.get("message", "")),
+        "checked_at": state.get("checked_at"),
+    }
+
+
+def _set_app_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        APP_SESSION_COOKIE,
+        token,
+        max_age=APP_SESSION_MAX_AGE,
+        httponly=True,
+        secure=APP_COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _raise_sso_required(message: str) -> None:
+    raise HTTPException(
+        status_code=428,
+        detail=message or "后台 DAS 会话已失效，请重新登录 SSO",
+        headers={"X-smartGPMS-Error": "SSO_LOGIN_REQUIRED"},
+    )
 
 
 def _public_ocr(
@@ -298,6 +452,9 @@ def _get_pending_print(token: str) -> dict[str, Any]:
         pending = pending_prints.get(token)
     if not pending:
         raise HTTPException(status_code=404, detail="打印任务不存在或已过期")
+    user = _application_user()
+    if int(pending.get("app_user_id", 0)) != int(user["id"]):
+        raise HTTPException(status_code=404, detail="打印任务不存在或已过期")
     return pending
 
 
@@ -307,21 +464,167 @@ def home():
 
 
 @app.get("/api/bootstrap")
-def bootstrap():
+def bootstrap(request: Request):
+    user = getattr(request.state, "app_user", None)
+    if not user:
+        return {
+            "version": app.version,
+            "auth": {
+                "authenticated": False,
+                "setup_required": auth.setup_required(),
+                "user": None,
+            },
+        }
+    return _bootstrap_payload(user)
+
+
+def _bootstrap_payload(user: dict[str, Any]) -> dict[str, Any]:
+    backend = _backend_public_state()
+    connected = backend["status"] == "logged_in"
+    if connected:
+        sso_login_coordinator.release()
+    login_allowed = False if connected else sso_login_coordinator.claim(int(user["id"]))
     return {
         "version": app.version,
-        "session": database.session(),
+        "auth": {
+            "authenticated": True,
+            "setup_required": False,
+            "user": public_user(user),
+        },
+        "session": {
+            **backend,
+            "login_allowed": login_allowed,
+            "login_waiting": not connected and not login_allowed,
+        },
         "credentials": credentials.public(),
         "initial_import": service.initial_import_state(),
     }
 
 
-@app.post("/api/login")
-def login(payload: LoginPayload):
-    return _run_foreground(_login, payload)
+@app.post("/api/auth/setup")
+def setup_application(payload: AppSetupPayload):
+    try:
+        user = auth.setup_admin(payload.username, payload.password, payload.display_name)
+        token = auth.create_session(int(user["id"]))
+        service.log_activity(
+            f"{user['username']}：已创建 smartGPMS 初始管理员",
+            source="auth",
+        )
+        response = JSONResponse(_bootstrap_payload(user))
+        _set_app_session_cookie(response, token)
+        return response
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _login(payload: LoginPayload):
+@app.post("/api/auth/login")
+def login_application(payload: AppLoginPayload):
+    user = auth.authenticate(payload.username, payload.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="用户名或密码不正确")
+    token = auth.create_session(int(user["id"]))
+    service.log_activity(
+        f"{user['username']}：已登录 smartGPMS",
+        source="auth",
+    )
+    response = JSONResponse(_bootstrap_payload(user))
+    _set_app_session_cookie(response, token)
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout_application(request: Request):
+    user = _application_user()
+    auth.logout(request.cookies.get(APP_SESSION_COOKIE, ""))
+    sso_login_coordinator.release(int(user["id"]))
+    service.log_activity(
+        f"{user['username']}：已退出 smartGPMS；后台 DAS 会话保持不变",
+        source="auth",
+    )
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(APP_SESSION_COOKIE, path="/")
+    return response
+
+
+@app.get("/api/admin/users")
+def list_application_users():
+    _require_admin()
+    return {"users": [public_user(row) for row in database.list_app_users()]}
+
+
+@app.post("/api/admin/users")
+def create_application_user(payload: AppUserCreatePayload):
+    _require_admin()
+    try:
+        user = auth.create_user(
+            payload.username,
+            payload.password,
+            payload.display_name,
+            payload.role,
+        )
+        service.log_activity(
+            f"smartGPMS 用户 {user['username']} 已创建",
+            source="auth",
+        )
+        return {"user": user}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.put("/api/admin/users/{user_id}")
+def update_application_user(user_id: int, payload: AppUserUpdatePayload):
+    administrator = _require_admin()
+    if payload.role not in {"admin", "operator"}:
+        raise HTTPException(status_code=400, detail="用户角色无效")
+    if int(administrator["id"]) == user_id and not payload.is_active:
+        raise HTTPException(status_code=400, detail="不能停用当前登录用户")
+    try:
+        user = database.update_app_user(
+            user_id,
+            display_name=payload.display_name.strip(),
+            role=payload.role,
+            is_active=payload.is_active,
+        )
+        return {"user": public_user(user)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/admin/users/{user_id}/password")
+def reset_application_password(user_id: int, payload: AppPasswordResetPayload):
+    _require_admin()
+    try:
+        return {"user": auth.reset_password(user_id, payload.password)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/auth/password")
+def change_application_password(payload: AppPasswordChangePayload):
+    user = _application_user()
+    try:
+        auth.change_password(
+            int(user["id"]), payload.current_password, payload.new_password
+        )
+        return {"ok": True, "reauthenticate": True}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/sso/login")
+def login_sso(payload: SsoLoginPayload):
+    user = _application_user()
+    if not sso_login_coordinator.claim(int(user["id"])):
+        raise HTTPException(status_code=409, detail="另一位用户正在建立后台连接，请稍候")
+    sso_login_coordinator.touch(int(user["id"]))
+    return _run_foreground(_login_sso, payload, user)
+
+
+def _login_sso(payload: SsoLoginPayload, app_user: dict[str, Any]):
     username = payload.username.strip()
     password = payload.password
     if not password:
@@ -329,7 +632,11 @@ def _login(payload: LoginPayload):
         if saved_username == username:
             password = saved_password
     try:
-        return service.login(username, password, payload.otp.strip(), payload.remember)
+        result = service.login(username, password, payload.otp.strip(), payload.remember)
+        sso_login_coordinator.release(int(app_user["id"]))
+        return result
+    except DasUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (DasBrowserError, LoginRequired, ValueError) as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     except Exception as exc:
@@ -341,8 +648,16 @@ def _login(payload: LoginPayload):
 @app.get("/api/session/status")
 def session_status():
     """Return the last background-verified state without opening DAS."""
+    user = _application_user()
+    backend = _backend_public_state()
+    connected = backend["status"] == "logged_in"
+    if connected:
+        sso_login_coordinator.release()
+    login_allowed = False if connected else sso_login_coordinator.claim(int(user["id"]))
     return {
-        **database.session(),
+        **backend,
+        "login_allowed": login_allowed,
+        "login_waiting": not connected and not login_allowed,
         "initial_import": service.initial_import_state(),
     }
 
@@ -421,7 +736,7 @@ def _verify(payload: VerifyPayload):
             gate_status = resolved.get("gate_status", "unknown")
         except LoginRequired as exc:
             database.update_session("logged_out", message=str(exc))
-            raise HTTPException(status_code=401, detail=str(exc)) from exc
+            _raise_sso_required(str(exc))
         except Exception:  # noqa: BLE001 - return a review row for this container
             if not record:
                 rows.append(
@@ -451,7 +766,7 @@ def _verify(payload: VerifyPayload):
             prepared = service.prepare_container(number) or record
         except LoginRequired as exc:
             database.update_session("logged_out", message=str(exc))
-            raise HTTPException(status_code=401, detail=str(exc)) from exc
+            _raise_sso_required(str(exc))
         except Exception as exc:  # noqa: BLE001 - keep other container rows available for review
             prepared = database.verification_row(number) or record
             errors.append(f"照片处理失败：{exc}")
@@ -468,7 +783,7 @@ def _verify(payload: VerifyPayload):
                 gate_status = "found"
             except LoginRequired as exc:
                 database.update_session("logged_out", message=str(exc))
-                raise HTTPException(status_code=401, detail=str(exc)) from exc
+                _raise_sso_required(str(exc))
             except GatePassNotFound:
                 gate = {"container_no": "", "seal_no": ""}
                 gate_status = "not_found"
@@ -618,7 +933,7 @@ def refresh_photos(payload: PhotoRefreshPayload):
         refreshed = _run_foreground(service.refresh_container_photos, number)
     except LoginRequired as exc:
         database.update_session("logged_out", message=str(exc))
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        _raise_sso_required(str(exc))
     except (RuntimeError, ValueError, DasBrowserError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     local = verify_local(VerifyPayload(containers=[number]))
@@ -697,6 +1012,7 @@ def print_gate(payload: PrintPayload):
 
 def _print_gate(payload: PrintPayload):
     _cleanup_pending_prints()
+    app_user = _application_user()
     record = database.cpm_by_id(payload.cpm_id)
     if not record:
         raise HTTPException(status_code=404, detail="未找到该箱号的本地核验记录，请重新核验")
@@ -750,7 +1066,8 @@ def _print_gate(payload: PrintPayload):
             pending_prints[token] = {
                 "cpm_id": payload.cpm_id,
                 "snapshot": snapshot,
-                "operator": payload.operator.strip(),
+                "operator": str(app_user["username"]),
+                "app_user_id": int(app_user["id"]),
                 "reason": payload.reason.strip(),
                 "created_at": time.monotonic(),
                 "pdf_path": str(pdf_path),
@@ -771,7 +1088,7 @@ def _print_gate(payload: PrintPayload):
         ) from exc
     except LoginRequired as exc:
         database.update_session("logged_out", message=str(exc))
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+        _raise_sso_required(str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -829,6 +1146,7 @@ def print_preview(token: str):
 @app.post("/api/print/confirm")
 def confirm_print(payload: PrintConfirmation):
     _cleanup_pending_prints()
+    _get_pending_print(payload.token)
     with pending_prints_lock:
         pending = pending_prints.pop(payload.token, None)
     if not pending:
@@ -857,7 +1175,6 @@ def health():
     return {
         "ok": True,
         "version": app.version,
-        "session": database.session().get("status", "logged_out"),
     }
 
 

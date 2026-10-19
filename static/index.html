@@ -7,12 +7,12 @@
   <link rel="icon" href="/static/assets/smartgpms-app.ico?v=1" sizes="any">
   <link rel="icon" type="image/png" href="/static/assets/smartgpms-app.png?v=1">
   <link rel="apple-touch-icon" href="/static/assets/smartgpms-app.png?v=1">
-  <link rel="stylesheet" href="/static/styles.css?v=0.16.3">
+  <link rel="stylesheet" href="/static/styles.css?v=0.18.0">
 </head>
 <body>
   <header class="topbar">
     <div class="brand-title"><span class="brand-mark">GP</span><span class="brand-copy"><strong class="app-title">Smart GPMS</strong><small>集装箱智能通门</small></span></div>
-    <div class="session-line"><i id="session-dot"></i><span id="session-text">未登录</span><button id="reload-page" class="refresh-button page-refresh-button" title="刷新页面" aria-label="刷新页面"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6"/><path d="M5.5 15a8 8 0 1 0 1.2-8.9L4 10"/></svg></button></div>
+    <div class="user-line"><span id="current-user" class="current-user hidden" title="当前 smartGPMS 用户"><i aria-hidden="true">●</i><span>未登录</span></span><button id="admin-users" class="topbar-text-button hidden" type="button">用户管理</button><button id="change-password" class="topbar-text-button hidden" type="button">修改密码</button><button id="app-logout" class="topbar-text-button hidden" type="button">退出</button><button id="reload-page" class="refresh-button page-refresh-button" title="刷新页面" aria-label="刷新页面"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6"/><path d="M5.5 15a8 8 0 1 0 1.2-8.9L4 10"/></svg></button></div>
   </header>
   <main id="workspace" class="workspace login-mode">
     <aside id="input-panel" class="input-panel hidden">
@@ -37,12 +37,14 @@
             <img class="login-reinvent-logo" src="/static/assets/newlogo-login-cropped.png" alt="REINVENT 2.0">
           </span>
         </div>
-        <label>USER ID<input id="username" autocomplete="username" autofocus></label>
-        <label>PASSWORD<input id="password" type="password" autocomplete="current-password" placeholder="已保存时可留空"></label>
-        <label>OTP<input id="otp" inputmode="numeric" autocomplete="one-time-code"></label>
-        <label class="remember"><input id="remember" type="checkbox" checked> <span id="credential-label">保存用户名密码(使用 Windows DPAPI 加密)</span></label>
-        <button id="login" class="login-button">Login</button>
-        <div id="login-message" class="form-message"></div>
+        <h2 id="app-login-title">登录 smartGPMS</h2>
+        <p id="app-login-hint">请输入系统用户名和密码。</p>
+        <label>用户名<input id="app-username" autocomplete="username" autofocus></label>
+        <label id="app-display-name-wrap" class="setup-only hidden">显示姓名<input id="app-display-name" autocomplete="name"></label>
+        <label>密码<input id="app-password" type="password" autocomplete="current-password"></label>
+        <label id="app-password-confirm-wrap" class="setup-only hidden">确认密码<input id="app-password-confirm" type="password" autocomplete="new-password"></label>
+        <button id="app-login" class="login-button">登录</button>
+        <div id="app-login-message" class="form-message"></div>
       </section>
 
       <section id="results" class="hidden">
@@ -64,6 +66,48 @@
       </section>
     </section>
   </main>
+  <div id="sso-dialog" class="blocking-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="sso-dialog-title">
+    <section class="login-card sso-card">
+      <div class="login-brand-row">
+        <img class="login-lg-logo" src="/static/assets/lg-logo.jpg" alt="LG Life's Good">
+        <span class="login-reinvent-clip"><img class="login-reinvent-logo" src="/static/assets/newlogo-login-cropped.png" alt="REINVENT 2.0"></span>
+      </div>
+      <h2 id="sso-dialog-title">连接 SSO / DAS</h2>
+      <p id="sso-waiting-message" class="hidden">另一位用户正在建立后台连接，请稍候。本页面会自动刷新连接状态。</p>
+      <div id="sso-login-form">
+        <label>USER ID<input id="username" autocomplete="username"></label>
+        <label>PASSWORD<input id="password" type="password" autocomplete="current-password" placeholder="已保存时可留空"></label>
+        <label>OTP<input id="otp" inputmode="numeric" autocomplete="one-time-code"></label>
+        <label class="remember"><input id="remember" type="checkbox" checked> <span id="credential-label">保存用户名密码(使用 Windows DPAPI 加密)</span></label>
+        <button id="login" class="login-button">Login</button>
+      </div>
+      <div id="login-message" class="form-message"></div>
+    </section>
+  </div>
+  <div id="user-admin-dialog" class="blocking-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="user-admin-title">
+    <section class="admin-card">
+      <div class="dialog-heading"><div><div class="eyebrow">SMART GPMS</div><h3 id="user-admin-title">用户管理</h3></div><button id="close-user-admin" type="button" class="dialog-close" aria-label="关闭">×</button></div>
+      <div class="admin-create-grid">
+        <label>用户名<input id="new-user-username" autocomplete="off"></label>
+        <label>显示姓名<input id="new-user-display-name" autocomplete="off"></label>
+        <label>初始密码<input id="new-user-password" type="password" autocomplete="new-password"></label>
+        <label>角色<select id="new-user-role"><option value="operator">操作员</option><option value="admin">管理员</option></select></label>
+        <button id="create-user" type="button">添加用户</button>
+      </div>
+      <div id="user-admin-message" class="form-message"></div>
+      <div id="user-list" class="user-list"></div>
+    </section>
+  </div>
+  <div id="password-dialog" class="blocking-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="password-dialog-title">
+    <section class="password-card">
+      <div class="dialog-heading"><div><div class="eyebrow">SMART GPMS</div><h3 id="password-dialog-title">修改密码</h3></div><button id="close-password-dialog" type="button" class="dialog-close" aria-label="关闭">×</button></div>
+      <label>当前密码<input id="current-app-password" type="password" autocomplete="current-password"></label>
+      <label>新密码<input id="new-app-password" type="password" autocomplete="new-password"></label>
+      <label>确认新密码<input id="confirm-app-password" type="password" autocomplete="new-password"></label>
+      <div id="password-message" class="form-message"></div>
+      <button id="save-password" class="login-button" type="button">保存新密码</button>
+    </section>
+  </div>
   <div id="image-viewer" class="image-viewer hidden" role="dialog" aria-modal="true" aria-label="原图预览">
     <div class="image-viewer-hint">滚轮缩放 · 按住图片拖动 · 右上角旋转 · 点击空白处关闭</div>
     <div class="image-viewer-controls" aria-label="原图查看工具">
@@ -104,6 +148,6 @@
     </section>
   </div>
   <div id="toast" role="status"></div>
-  <script src="/static/app.js?v=0.16.3"></script>
+  <script src="/static/app.js?v=0.18.0"></script>
 </body>
 </html>
